@@ -14,6 +14,7 @@ use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemo
 
 use crate::IRQ_MAX;
 
+use super::sev::Sev;
 // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
 // trait (in this case `ByteValued`) where:
 // * the type that is implementing the trait is foreign or
@@ -127,7 +128,7 @@ fn compute_mp_size(num_cpus: u8) -> usize {
 }
 
 /// Performs setup of the MP table for the given `num_cpus`.
-pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
+pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8, sev: &mut Option<Sev>) -> Result<()> {
     if u32::from(num_cpus) > MAX_SUPPORTED_CPUS {
         return Err(Error::TooManyCpus);
     }
@@ -282,6 +283,12 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
             .map_err(|_| Error::WriteMpcTable)?;
     }
 
+    // Try just using mp_size and base_mp
+    if let Some(sev) = sev {
+        let len = mp_size;
+        sev.add_measured_region(GuestAddress(MPTABLE_START), len as u64);
+    }
+
     Ok(())
 }
 
@@ -311,7 +318,7 @@ mod tests {
         )
         .unwrap();
 
-        setup_mptable(&mem, num_cpus).unwrap();
+        setup_mptable(&mem, num_cpus, &mut None).unwrap();
     }
 
     #[test]
@@ -323,7 +330,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(setup_mptable(&mem, num_cpus).is_err());
+        assert!(setup_mptable(&mem, num_cpus, &mut None).is_err());
     }
 
     #[test]
@@ -335,7 +342,7 @@ mod tests {
         )
         .unwrap();
 
-        setup_mptable(&mem, num_cpus).unwrap();
+        setup_mptable(&mem, num_cpus, &mut None).unwrap();
 
         let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
 
@@ -354,7 +361,7 @@ mod tests {
         )
         .unwrap();
 
-        setup_mptable(&mem, num_cpus).unwrap();
+        setup_mptable(&mem, num_cpus, &mut None).unwrap();
 
         let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
         let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
@@ -391,7 +398,7 @@ mod tests {
         .unwrap();
 
         for i in 0..MAX_SUPPORTED_CPUS as u8 {
-            setup_mptable(&mem, i).unwrap();
+            setup_mptable(&mem, i, &mut None).unwrap();
 
             let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
             let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
@@ -427,7 +434,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = setup_mptable(&mem, cpus as u8).unwrap_err();
+        let result = setup_mptable(&mem, cpus as u8, &mut None).unwrap_err();
         assert_eq!(result, Error::TooManyCpus);
     }
 }

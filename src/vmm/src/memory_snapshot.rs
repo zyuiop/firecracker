@@ -186,7 +186,8 @@ impl SnapshotMemory for GuestMemoryMmap {
             regions.push((f, GuestAddress(region.base_address), region.size));
         }
 
-        vm_memory::create_guest_memory(&regions, track_dirty_pages).map_err(Error::CreateMemory)
+        vm_memory::create_guest_memory(&regions, track_dirty_pages, false)
+            .map_err(Error::CreateMemory)
     }
 }
 
@@ -210,7 +211,7 @@ mod tests {
             (None, GuestAddress(0), page_size),
             (None, GuestAddress(page_size as u64 * 2), page_size),
         ];
-        let guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true).unwrap();
+        let guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true, false).unwrap();
 
         let expected_memory_state = GuestMemoryState {
             regions: vec![
@@ -235,7 +236,7 @@ mod tests {
             (None, GuestAddress(0), page_size * 3),
             (None, GuestAddress(page_size as u64 * 4), page_size * 3),
         ];
-        let guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true).unwrap();
+        let guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true, false).unwrap();
 
         let expected_memory_state = GuestMemoryState {
             regions: vec![
@@ -265,7 +266,7 @@ mod tests {
             (None, GuestAddress(0), page_size * 2),
             (None, GuestAddress(page_size as u64 * 3), page_size * 2),
         ];
-        let guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true).unwrap();
+        let guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true, false).unwrap();
         // Check that Firecracker bitmap is clean.
         let _res: std::result::Result<(), Error> = guest_memory.iter().try_for_each(|r| {
             assert!(!r.bitmap().dirty_at(0));

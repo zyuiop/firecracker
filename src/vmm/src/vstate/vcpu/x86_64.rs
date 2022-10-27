@@ -7,17 +7,20 @@
 
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 use std::{fmt, result};
 
 use arch::x86_64::interrupts;
 use arch::x86_64::msr::SetMSRsError;
 use arch::x86_64::regs::{SetupFpuError, SetupRegistersError, SetupSpecialRegistersError};
+use arch::x86_64::sev::Sev;
+use arch::{initrd_load_addr, InitrdConfig};
 use cpuid::{c3, filter_cpuid, msrs_to_save_by_cpuid, t2, t2s, VmSpec};
 use kvm_bindings::{
     kvm_debugregs, kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
     kvm_xsave, CpuId, Msrs, KVM_MAX_MSR_ENTRIES,
 };
-use kvm_ioctls::{VcpuExit, VcpuFd};
+use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use logger::{error, warn, IncMetric, METRICS};
 use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
 use versionize_derive::Versionize;
@@ -253,6 +256,9 @@ impl KvmVcpu {
         kernel_start_addr: GuestAddress,
         vcpu_config: &VcpuConfig,
         mut cpuid: CpuId,
+        sev: bool,
+        kernel_len: u64,
+        initrd: &Option<InitrdConfig>,
     ) -> std::result::Result<(), KvmVcpuConfigureError> {
         let cpuid_vm_spec = VmSpec::new(self.index, vcpu_config.vcpu_count, vcpu_config.smt)
             .map_err(KvmVcpuConfigureError::VmSpec)?;
@@ -277,6 +283,20 @@ impl KvmVcpu {
             CpuFeaturesTemplate::C3 => c3::set_cpuid_entries(&mut cpuid, &cpuid_vm_spec)
                 .map_err(KvmVcpuConfigureError::SetCpuidEntries)?,
             CpuFeaturesTemplate::None => {}
+        }
+
+        //ADD MTRR CPUID HERE
+        let entries = cpuid.as_mut_slice();
+
+        for entry in entries.iter_mut() {
+            if entry.function == 1 && entry.index == 0 {
+                // Enable MTRR feature
+                entry.edx |= 1 << 0xC;
+                // Patch tsc deadline timer bit
+                entry.ecx |= 1 << 0x18;
+                // Patch hypervisor bit
+                entry.ecx |= 1 << 0x1F;
+            }
         }
 
         self.fd
@@ -310,15 +330,30 @@ impl KvmVcpu {
             self.msr_list.extend(t2s::msr_entries_to_save());
             t2s::update_msr_entries(&mut msr_boot_entries);
         }
+
+        let initrd_len = if let Some(initrd) = initrd {
+            initrd.size
+        } else {
+            0
+        };
+
+        let initrd_load_addr =
+            initrd_load_addr(guest_mem, initrd_len).expect("Failed to compute initrd load address");
         // By this point we know that at snapshot, the list of MSRs we need to
         // save is `architectural MSRs` + `MSRs inferred through CPUID` + `other
         // MSRs defined by the template`
-
         arch::x86_64::msr::set_msrs(&self.fd, &msr_boot_entries)?;
-        arch::x86_64::regs::setup_regs(&self.fd, kernel_start_addr.raw_value() as u64)?;
+        arch::x86_64::regs::setup_regs(
+            &self.fd,
+            kernel_start_addr.raw_value() as u64,
+            kernel_len,
+            initrd_len as u64,
+            initrd_load_addr,
+        )?;
         arch::x86_64::regs::setup_fpu(&self.fd)?;
-        arch::x86_64::regs::setup_sregs(guest_mem, &self.fd)?;
+        arch::x86_64::regs::setup_sregs(guest_mem, &self.fd, sev)?;
         arch::x86_64::interrupts::set_lint(&self.fd)?;
+
         Ok(())
     }
 
@@ -505,7 +540,12 @@ impl KvmVcpu {
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
-    pub fn run_arch_emulation(&self, exit: VcpuExit) -> super::Result<VcpuEmulation> {
+    pub fn run_arch_emulation(
+        &self,
+        exit: VcpuExit,
+        vm_fd: &Arc<VmFd>,
+        guest_mem: &GuestMemoryMmap,
+    ) -> super::Result<VcpuEmulation> {
         match exit {
             VcpuExit::IoIn(addr, data) => {
                 if let Some(pio_bus) = &self.pio_bus {
@@ -520,6 +560,66 @@ impl KvmVcpu {
                     METRICS.vcpu.exit_io_out.inc();
                 }
                 Ok(VcpuEmulation::Handled)
+            }
+            VcpuExit::MemoryFault(flags, gpa, size) => {
+                // info!("memory fault: flags=0x{:x}, gpa=0x{:x}, size=0x{:x}", flags, gpa, size);
+
+                Sev::set_page_state(vm_fd, gpa >> 12, size, flags == 8);
+
+                Ok(VcpuEmulation::Handled)
+            }
+            VcpuExit::Vmgexit(ghcb_msr, _error) => {
+                // info!("vmgexit, ghcb msr: 0x{:x}, error: {}", ghcb_msr, error);
+                //might add this to the kernel instead of doing it here for performance
+                let mask = 0xf;
+                let req = ghcb_msr & 0xfff;
+                // if the request is 0, the ghcb_msr value is the gpa of the ghcb page in the guest
+                if req == 0 {
+                    // info!("vmgexit, ghcb msr: 0x{:x}, error: {}", ghcb_msr, error);
+                    Sev::handle_vmgexit(ghcb_msr, guest_mem, vm_fd).unwrap();
+                    return Ok(VcpuEmulation::Handled);
+                }
+                if req == 0x014 {
+                    // info!("vmgexit msr protocol, ghcb_msr = 0x{:x}", ghcb_msr);
+                    let op = (ghcb_msr >> 52) & mask;
+
+                    let mut gfn = (ghcb_msr >> 12) & 0xffffffffff;
+
+                    let mut page_size = 0x1000;
+
+                    if ghcb_msr >> 63 != 0 {
+                        page_size = 0x200000;
+                        gfn = (gfn << 12) >> 21;
+                    }
+
+                    if ghcb_msr == 0x0000000000000014 {
+                        //this is the first timestamp for firmware entry
+                        if let Some(pio_bus) = &self.pio_bus {
+                            pio_bus.write(0x80, &[0x31]);
+                        }
+                        return Ok(VcpuEmulation::Handled);
+                    }
+
+                    if ghcb_msr == 0x0030000000000014 {
+                        if let Some(pio_bus) = &self.pio_bus {
+                            pio_bus.write(0x80, &[0x39]);
+                        }
+
+                        return Ok(VcpuEmulation::Handled);
+                    }
+                    if ghcb_msr == 0x0040000000000014 {
+                        if let Some(pio_bus) = &self.pio_bus {
+                            pio_bus.write(0x80, &[0x40]);
+                        }
+
+                        return Ok(VcpuEmulation::Handled);
+                    }
+
+                    Sev::set_page_state(vm_fd, gfn, page_size, op == 1);
+                    return Ok(VcpuEmulation::Handled);
+                }
+                error!("Unsupported ghcb request: 0x{:x}", req);
+                Ok(VcpuEmulation::Stopped)
             }
             unexpected_exit => {
                 METRICS.vcpu.failures.inc();
@@ -666,7 +766,10 @@ mod tests {
                 &vm_mem,
                 GuestAddress(0),
                 &vcpu_config,
-                vm.supported_cpuid().clone()
+                vm.supported_cpuid().clone(),
+                false,
+                0,
+                &None,
             )
             .is_ok());
 
@@ -677,6 +780,9 @@ mod tests {
             GuestAddress(arch::get_kernel_start()),
             &vcpu_config,
             vm.supported_cpuid().clone(),
+            false,
+            0,
+            &None,
         );
 
         // Test configure while using the C3 template.
@@ -686,6 +792,9 @@ mod tests {
             GuestAddress(0),
             &vcpu_config,
             vm.supported_cpuid().clone(),
+            false,
+            0,
+            &None,
         );
 
         // Test configure while using the T2S template.
@@ -695,6 +804,9 @@ mod tests {
             GuestAddress(0),
             &vcpu_config,
             vm.supported_cpuid().clone(),
+            false,
+            0,
+            &None,
         );
 
         match &get_vendor_id_from_host().unwrap() {

@@ -9,6 +9,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_arch = "x86_64")]
+use arch::x86_64::sev::Sev;
 use arch::InitrdConfig;
 #[cfg(target_arch = "x86_64")]
 use cpuid::common::is_same_model;
@@ -16,6 +18,7 @@ use devices::legacy::serial::ReadableFd;
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::RTCDevice;
 use devices::legacy::{EventFdTrigger, SerialDevice, SerialEventsWrapper, SerialWrapper};
+use devices::pseudo::KernelType;
 use devices::virtio::{Balloon, Block, MmioTransport, Net, VirtioDevice, Vsock, VsockUnixBackend};
 use event_manager::{MutEventSubscriber, SubscriberOps};
 use libc::EFD_NONBLOCK;
@@ -32,7 +35,7 @@ use userfaultfd::Uffd;
 use utils::eventfd::EventFd;
 use utils::terminal::Terminal;
 use utils::time::TimestampUs;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 #[cfg(target_arch = "aarch64")]
 use vm_superio::Rtc;
 use vm_superio::Serial;
@@ -90,10 +93,16 @@ pub enum StartMicrovmError {
     OpenBlockDevice(io::Error),
     /// Cannot initialize a MMIO Device or add a device to the MMIO Bus or cmdline.
     RegisterMmioDevice(device_manager::mmio::Error),
+    /// Cannot initialize a PIO Device
+    RegisterPioDevice(devices::BusError),
     /// Cannot restore microvm state.
     RestoreMicrovmState(MicrovmStateError),
     /// Unable to set VmResources.
     SetVmResources(VmConfigError),
+    /// Cannot read guest owner DH key
+    ReadDHCert(io::Error),
+    /// Cannot read guest session data
+    ReadSession(io::Error),
 }
 impl std::error::Error for StartMicrovmError {}
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -175,8 +184,20 @@ impl Display for StartMicrovmError {
                     err_msg
                 )
             }
+            RegisterPioDevice(err) => {
+                let mut err_msg = format!("{:?}", err);
+                err_msg = err_msg.replace('\"', "");
+                write!(
+                    f,
+                    "Cannot initialize a PIO Device or add a device to the PIO Bus. \
+                     {}",
+                    err_msg
+                )
+            }
             RestoreMicrovmState(err) => write!(f, "Cannot restore microvm state. Error: {}", err),
             SetVmResources(err) => write!(f, "Cannot set vm resources. Error: {}", err),
+            ReadDHCert(err) => write!(f, "Cannot read guest owner DH public key: {}", err),
+            ReadSession(err) => write!(f, "Cannot read guest owner session data: {}", err),
         }
     }
 }
@@ -233,12 +254,30 @@ fn create_vmm_and_vcpus(
     guest_memory: GuestMemoryMmap,
     uffd: Option<Uffd>,
     track_dirty_pages: bool,
+    hugepages: bool,
     vcpu_count: u8,
+    sev_enabled: bool,
+    snp: bool,
+    timestamp: TimestampUs,
+    policy: u32,
+    dh_cert: &mut Option<std::fs::File>,
+    session: &mut Option<std::fs::File>,
 ) -> std::result::Result<(Vmm, Vec<Vcpu>), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     // Set up Kvm Vm and register memory regions.
-    let mut vm = setup_kvm_vm(&guest_memory, track_dirty_pages)?;
+    let mut vm = setup_kvm_vm(&guest_memory, track_dirty_pages, hugepages, snp)?;
+
+    let mut sev = None;
+    if sev_enabled {
+        let mut sev_dev = Sev::new(vm.fd().clone(), snp, timestamp, policy);
+        if !snp {
+            sev_dev.sev_init(session, dh_cert).unwrap();
+        } else {
+            sev_dev.snp_init().unwrap();
+        }
+        sev = Some(sev_dev);
+    }
 
     let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK)
         .map_err(Error::EventFd)
@@ -254,13 +293,17 @@ fn create_vmm_and_vcpus(
     )
     .map_err(StartMicrovmError::RegisterMmioDevice)?;
 
+    if let Some(sev) = sev.as_mut() {
+        sev.add_shared_region(GuestAddress(arch::MMIO_MEM_START), arch::MMIO_MEM_SIZE)
+    }
+
     let vcpus;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
     #[cfg(target_arch = "x86_64")]
     let pio_device_manager = {
         setup_interrupt_controller(&mut vm)?;
-        vcpus = create_vcpus(&vm, vcpu_count, &vcpus_exit_evt).map_err(Internal)?;
+        vcpus = create_vcpus(&vm, vcpu_count, &vcpus_exit_evt, &guest_memory).map_err(Internal)?;
 
         // Make stdout non blocking.
         set_stdout_nonblocking();
@@ -303,6 +346,8 @@ fn create_vmm_and_vcpus(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(target_arch = "x86_64")]
+        sev,
     };
 
     Ok((vmm, vcpus))
@@ -325,20 +370,60 @@ pub fn build_microvm_for_boot(
 
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
+    let t_init = TimestampUs::default();
 
     let boot_config = vm_resources
         .boot_source_builder()
         .ok_or(MissingKernelConfig)?;
 
+    let sev_enabled = vm_resources.sev.is_some();
+
     let track_dirty_pages = vm_resources.track_dirty_pages();
-    let guest_memory =
-        create_guest_memory(vm_resources.vm_config().mem_size_mib, track_dirty_pages)?;
+    let hugepages = vm_resources.hugepages();
+
+    let guest_memory = create_guest_memory(
+        vm_resources.vm_config().mem_size_mib,
+        track_dirty_pages,
+        hugepages,
+    )?;
     let vcpu_config = vm_resources.vcpu_config();
-    let entry_addr = load_kernel(boot_config, &guest_memory)?;
-    let initrd = load_initrd_from_config(boot_config, &guest_memory)?;
+
+    let entry_addr = if !sev_enabled {
+        load_kernel(boot_config, &guest_memory)?
+    } else {
+        arch::x86_64::sev::FIRMWARE_ADDR
+    };
+
+    let initrd = load_initrd_from_config(boot_config, &guest_memory, sev_enabled)?;
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
     let mut boot_cmdline = boot_config.cmdline.clone();
+
+    let policy: u32 = match &vm_resources.sev {
+        None => 0,
+        Some(cfg) => cfg.policy,
+    };
+
+    let snp = match &vm_resources.sev {
+        None => false,
+        Some(cfg) => cfg.snp,
+    };
+
+    let mut dh_cert: Option<std::fs::File> = match &vm_resources.sev {
+        None => None,
+        Some(cfg) => match &cfg.dh_cert {
+            None => None,
+            Some(path) => Some(std::fs::File::open(path).map_err(|err| ReadDHCert(err))?),
+        },
+    };
+
+    let mut session: Option<std::fs::File> = match &vm_resources.sev {
+        None => None,
+        Some(cfg) => match &cfg.session_path {
+            None => None,
+            Some(path) => Some(std::fs::File::open(path).map_err(|err| ReadSession(err))?),
+        },
+    };
 
     let (mut vmm, mut vcpus) = create_vmm_and_vcpus(
         instance_info,
@@ -346,14 +431,45 @@ pub fn build_microvm_for_boot(
         guest_memory,
         None,
         track_dirty_pages,
+        hugepages,
         vcpu_config.vcpu_count,
+        sev_enabled,
+        snp,
+        t_init.clone(),
+        policy,
+        &mut dh_cert,
+        &mut session,
     )?;
+
+    let mut kernel_len: u64 = 0;
+    if sev_enabled {
+        let kernel_type = attach_fw_cfg_device(
+            &mut vmm,
+            boot_config,
+            &vm_resources.sev.as_ref().unwrap().kernel_hash_path,
+            &vm_resources.sev.as_ref().unwrap().initrd_hash_path,
+        )?;
+
+        kernel_len = vmm
+            .setup_sev(
+                &vm_resources.sev.as_ref().unwrap().firmware_path,
+                boot_config
+                    .kernel_file
+                    .try_clone()
+                    .map_err(|err| StartMicrovmError::Internal(Error::KernelFile(err)))
+                    .unwrap(),
+                kernel_type,
+                &initrd,
+            )
+            .unwrap();
+    }
 
     // The boot timer device needs to be the first device attached in order
     // to maintain the same MMIO address referenced in the documentation
     // and tests.
     if vm_resources.boot_timer {
         attach_boot_timer_device(&mut vmm, request_ts)?;
+        attach_debug_port_device(&mut vmm, t_init)?;
     }
 
     if let Some(balloon) = vm_resources.balloon.get() {
@@ -380,13 +496,19 @@ pub fn build_microvm_for_boot(
     attach_legacy_devices_aarch64(event_manager, &mut vmm, &mut boot_cmdline).map_err(Internal)?;
 
     configure_system_for_boot(
-        &vmm,
+        &mut vmm,
         vcpus.as_mut(),
         vcpu_config,
         entry_addr,
         &initrd,
         boot_cmdline,
+        kernel_len,
     )?;
+
+    #[cfg(target_arch = "x86_64")]
+    if sev_enabled {
+        vmm.finish_sev().unwrap();
+    }
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     vmm.start_vcpus(
@@ -505,7 +627,14 @@ pub fn build_microvm_from_snapshot(
         guest_memory.clone(),
         uffd,
         track_dirty_pages,
+        false,
         vcpu_count,
+        false,
+        false,
+        TimestampUs::default(),
+        0,
+        &mut None,
+        &mut None,
     )?;
 
     #[cfg(target_arch = "x86_64")]
@@ -545,6 +674,7 @@ pub fn build_microvm_from_snapshot(
         smt: Some(microvm_state.vm_info.smt),
         cpu_template: Some(microvm_state.vm_info.cpu_template),
         track_dirty_pages: Some(track_dirty_pages),
+        hugepages: None,
     })?;
 
     // Restore the boot source config paths.
@@ -553,7 +683,7 @@ pub fn build_microvm_from_snapshot(
     // Restore devices states.
     let mmio_ctor_args = MMIODevManagerConstructorArgs {
         mem: guest_memory,
-        vm: vmm.vm.fd(),
+        vm: &vmm.vm.fd(),
         event_manager,
         for_each_restored_device: VmResources::update_from_restored_device,
         vm_resources,
@@ -595,6 +725,7 @@ pub fn build_microvm_from_snapshot(
 pub fn create_guest_memory(
     mem_size_mib: usize,
     track_dirty_pages: bool,
+    hugepages: bool,
 ) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
     let mem_size = mem_size_mib << 20;
     let arch_mem_regions = arch::arch_memory_regions(mem_size);
@@ -605,6 +736,7 @@ pub fn create_guest_memory(
             .map(|(addr, size)| (None, *addr, *size))
             .collect::<Vec<_>>()[..],
         track_dirty_pages,
+        hugepages,
     )
     .map_err(StartMicrovmError::GuestMemoryMmap)
 }
@@ -642,12 +774,14 @@ fn load_kernel(
 fn load_initrd_from_config(
     boot_cfg: &BootConfig,
     vm_memory: &GuestMemoryMmap,
+    sev: bool,
 ) -> std::result::Result<Option<InitrdConfig>, StartMicrovmError> {
     use self::StartMicrovmError::InitrdRead;
 
     Ok(match &boot_cfg.initrd_file {
         Some(f) => Some(load_initrd(
             vm_memory,
+            sev,
             &mut f.try_clone().map_err(InitrdRead)?,
         )?),
         None => None,
@@ -662,6 +796,7 @@ fn load_initrd_from_config(
 /// Returns the result of initrd loading
 fn load_initrd<F>(
     vm_memory: &GuestMemoryMmap,
+    sev: bool,
     image: &mut F,
 ) -> std::result::Result<InitrdConfig, StartMicrovmError>
 where
@@ -685,12 +820,21 @@ where
     image.seek(SeekFrom::Start(0)).map_err(InitrdRead)?;
 
     // Get the target address
-    let address = arch::initrd_load_addr(vm_memory, size).map_err(|_| InitrdLoad)?;
+    let address = if !sev {
+        arch::initrd_load_addr(vm_memory, size).map_err(|_| InitrdLoad)?
+    } else {
+        let initrd_load_addr = arch::initrd_load_addr(vm_memory, size).map_err(|_| InitrdLoad)?;
+        let align_to_pagesize = |address| address & !(0x200000 - 1);
+        let load_addr_aligned = align_to_pagesize(initrd_load_addr);
+        //plain text inird will be just before its final resting place
+        align_to_pagesize(load_addr_aligned - size as u64)
+    };
 
     // Load the image into memory
     vm_memory
         .read_from(GuestAddress(address), image, size)
         .map_err(|_| InitrdLoad)?;
+    let address = arch::initrd_load_addr(vm_memory, size).map_err(|_| InitrdLoad)?;
 
     Ok(InitrdConfig {
         address: GuestAddress(address),
@@ -701,15 +845,42 @@ where
 pub(crate) fn setup_kvm_vm(
     guest_memory: &GuestMemoryMmap,
     track_dirty_pages: bool,
+    hugepages: bool,
+    snp: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
     use self::StartMicrovmError::Internal;
     let kvm = KvmContext::new()
         .map_err(Error::KvmContext)
         .map_err(Internal)?;
-    let mut vm = Vm::new(kvm.fd()).map_err(Error::Vm).map_err(Internal)?;
-    vm.memory_init(guest_memory, kvm.max_memslots(), track_dirty_pages)
+    let mut vm = Vm::new(kvm.fd(), snp)
         .map_err(Error::Vm)
         .map_err(Internal)?;
+    vm.memory_init(guest_memory, kvm.max_memslots(), track_dirty_pages, snp)
+        .map_err(Error::Vm)
+        .map_err(Internal)?;
+
+    for region in guest_memory.iter() {
+        if hugepages {
+            let ret = unsafe {
+                libc::madvise(
+                    region.as_ptr() as *mut libc::c_void,
+                    region.size() as libc::size_t,
+                    libc::MADV_HUGEPAGE,
+                )
+            };
+            if ret != 0 {
+                let err = io::Error::last_os_error();
+                let errno = err.raw_os_error().unwrap();
+                if errno == libc::EINVAL {
+                    println!("kernel not configured with CONFIG_TRANSPARENT_HUGEPAGE");
+                } else {
+                    println!("madvise error: {}", err);
+                }
+                println!("failed to back memory region with huge pages");
+            }
+        }
+    }
+
     Ok(vm)
 }
 
@@ -772,7 +943,7 @@ fn create_pio_dev_manager_with_legacy_devices(
     let mut pio_dev_mgr =
         PortIODeviceManager::new(serial, i8042_reset_evfd).map_err(Error::CreateLegacyDevice)?;
     pio_dev_mgr
-        .register_devices(vm.fd())
+        .register_devices(&vm.fd())
         .map_err(Error::LegacyIOBus)?;
     Ok(pio_dev_mgr)
 }
@@ -813,12 +984,17 @@ fn attach_legacy_devices_aarch64(
         .map_err(Error::RegisterMMIODevice)
 }
 
-fn create_vcpus(vm: &Vm, vcpu_count: u8, exit_evt: &EventFd) -> super::Result<Vec<Vcpu>> {
+fn create_vcpus(
+    vm: &Vm,
+    vcpu_count: u8,
+    exit_evt: &EventFd,
+    guest_memory: &GuestMemoryMmap,
+) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_count as usize);
     for cpu_idx in 0..vcpu_count {
         let exit_evt = exit_evt.try_clone().map_err(Error::EventFd)?;
 
-        let vcpu = Vcpu::new(cpu_idx, vm, exit_evt).map_err(Error::VcpuCreate)?;
+        let vcpu = Vcpu::new(cpu_idx, vm, exit_evt, guest_memory).map_err(Error::VcpuCreate)?;
         #[cfg(target_arch = "aarch64")]
         vcpu.kvm_vcpu.init(vm.fd()).map_err(Error::VcpuInit)?;
 
@@ -830,12 +1006,13 @@ fn create_vcpus(vm: &Vm, vcpu_count: u8, exit_evt: &EventFd) -> super::Result<Ve
 /// Configures the system for booting Linux.
 #[cfg_attr(target_arch = "aarch64", allow(unused))]
 pub fn configure_system_for_boot(
-    vmm: &Vmm,
+    vmm: &mut Vmm,
     vcpus: &mut [Vcpu],
     vcpu_config: VcpuConfig,
     entry_addr: GuestAddress,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: LoaderKernelCmdline,
+    kernel_len: u64,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
     #[cfg(target_arch = "x86_64")]
@@ -847,6 +1024,9 @@ pub fn configure_system_for_boot(
                     entry_addr,
                     &vcpu_config,
                     vmm.vm.supported_cpuid().clone(),
+                    vmm.sev.is_some(),
+                    kernel_len,
+                    initrd,
                 )
                 .map_err(Error::VcpuConfigure)
                 .map_err(Internal)?;
@@ -864,7 +1044,17 @@ pub fn configure_system_for_boot(
             &boot_cmdline,
         )
         .map_err(LoadCommandline)?;
+
+        #[cfg(target_arch = "x86_64")]
+        if let Some(sev) = vmm.sev.as_mut() {
+            sev.add_measured_region(
+                GuestAddress(arch::x86_64::layout::CMDLINE_START),
+                boot_cmdline.as_cstring().unwrap().as_bytes().len() as u64,
+            );
+        }
+
         arch::x86_64::configure_system(
+            &mut vmm.sev,
             &vmm.guest_memory,
             vm_memory::GuestAddress(arch::x86_64::layout::CMDLINE_START),
             cmdline_size,
@@ -915,7 +1105,7 @@ fn attach_virtio_device<T: 'static + VirtioDevice + MutEventSubscriber>(
     // The device mutex mustn't be locked here otherwise it will deadlock.
     let device = MmioTransport::new(vmm.guest_memory().clone(), device);
     vmm.mmio_device_manager
-        .register_mmio_virtio_for_boot(vmm.vm.fd(), id, device, cmdline)
+        .register_mmio_virtio_for_boot(&vmm.vm.fd(), id, device, cmdline)
         .map_err(RegisterMmioDevice)
         .map(|_| ())
 }
@@ -933,6 +1123,46 @@ pub(crate) fn attach_boot_timer_device(
         .map_err(RegisterMmioDevice)?;
 
     Ok(())
+}
+
+pub(crate) fn attach_debug_port_device(
+    vmm: &mut Vmm,
+    t_init: TimestampUs,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let debug_port = Arc::new(Mutex::new(devices::pseudo::DebugPort::new(t_init)));
+
+    vmm.pio_device_manager
+        .io_bus
+        .insert(debug_port, 0x80, 0x1)
+        .map_err(RegisterPioDevice)?;
+    Ok(())
+}
+
+pub(crate) fn attach_fw_cfg_device(
+    vmm: &mut Vmm,
+    boot_config: &BootConfig,
+    kernel_hashes_path: &String,
+    initrd_hashes_path: &Option<String>,
+) -> std::result::Result<KernelType, StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let fw_cfg = Arc::new(Mutex::new(devices::pseudo::FwCfg::new(
+        boot_config.kernel_file.try_clone().unwrap(),
+        kernel_hashes_path,
+        initrd_hashes_path,
+        vmm.guest_memory().clone(),
+        &mut vmm.sev,
+    )));
+
+    let kernel_type = fw_cfg.try_lock().unwrap().kernel_type();
+
+    vmm.pio_device_manager
+        .io_bus
+        .insert(fw_cfg, devices::pseudo::FW_CFG_REG, 0x1)
+        .map_err(RegisterPioDevice)?;
+    Ok(kernel_type)
 }
 
 fn attach_block_devices<'a>(
@@ -1092,14 +1322,14 @@ pub mod tests {
     }
 
     pub(crate) fn default_vmm() -> Vmm {
-        let guest_memory = create_guest_memory(128, false).unwrap();
+        let guest_memory = create_guest_memory(128, false, false).unwrap();
 
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK)
             .map_err(Error::EventFd)
             .map_err(StartMicrovmError::Internal)
             .unwrap();
 
-        let mut vm = setup_kvm_vm(&guest_memory, false).unwrap();
+        let mut vm = setup_kvm_vm(&guest_memory, false, false, false).unwrap();
         let mmio_device_manager = default_mmio_device_manager();
         #[cfg(target_arch = "x86_64")]
         let pio_device_manager = default_portio_device_manager();
@@ -1126,6 +1356,8 @@ pub mod tests {
             mmio_device_manager,
             #[cfg(target_arch = "x86_64")]
             pio_device_manager,
+            #[cfg(target_arch = "x86_64")]
+            sev: None,
         }
     }
 
@@ -1263,7 +1495,7 @@ pub mod tests {
         #[cfg(target_arch = "aarch64")]
         let gm = create_guest_mem_with_size(mem_size + arch::aarch64::layout::FDT_MAX_SIZE);
 
-        let res = load_initrd(&gm, &mut Cursor::new(&image));
+        let res = load_initrd(&gm, false, &mut Cursor::new(&image));
         assert!(res.is_ok());
         let initrd = res.unwrap();
         assert!(gm.address_in_range(initrd.address));
@@ -1274,7 +1506,7 @@ pub mod tests {
     fn test_load_initrd_no_memory() {
         let gm = create_guest_mem_with_size(79);
         let image = make_test_bin();
-        let res = load_initrd(&gm, &mut Cursor::new(&image));
+        let res = load_initrd(&gm, false, &mut Cursor::new(&image));
         assert!(res.is_err());
         assert_eq!(
             StartMicrovmError::InitrdLoad.to_string(),
@@ -1287,7 +1519,7 @@ pub mod tests {
         let image = vec![1, 2, 3, 4];
         let gm = create_guest_mem_at(GuestAddress(arch::PAGE_SIZE as u64 + 1), image.len() * 2);
 
-        let res = load_initrd(&gm, &mut Cursor::new(&image));
+        let res = load_initrd(&gm, false, &mut Cursor::new(&image));
         assert!(res.is_err());
         assert_eq!(
             StartMicrovmError::InitrdLoad.to_string(),
@@ -1307,13 +1539,13 @@ pub mod tests {
 
         // Case 1: create guest memory without dirty page tracking
         {
-            let guest_memory = create_guest_memory(mem_size, false).unwrap();
+            let guest_memory = create_guest_memory(mem_size, false, false).unwrap();
             assert!(!is_dirty_tracking_enabled(&guest_memory));
         }
 
         // Case 2: create guest memory with dirty page tracking
         {
-            let guest_memory = create_guest_memory(mem_size, true).unwrap();
+            let guest_memory = create_guest_memory(mem_size, true, false).unwrap();
             assert!(is_dirty_tracking_enabled(&guest_memory));
         }
     }
@@ -1321,16 +1553,16 @@ pub mod tests {
     #[test]
     fn test_create_vcpus() {
         let vcpu_count = 2;
-        let guest_memory = create_guest_memory(128, false).unwrap();
+        let guest_memory = create_guest_memory(128, false, false).unwrap();
 
         #[allow(unused_mut)]
-        let mut vm = setup_kvm_vm(&guest_memory, false).unwrap();
+        let mut vm = setup_kvm_vm(&guest_memory, false, false, false).unwrap();
         let evfd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
 
         #[cfg(target_arch = "x86_64")]
         setup_interrupt_controller(&mut vm).unwrap();
 
-        let vcpu_vec = create_vcpus(&vm, vcpu_count, &evfd).unwrap();
+        let vcpu_vec = create_vcpus(&vm, vcpu_count, &evfd, &guest_memory).unwrap();
         assert_eq!(vcpu_vec.len(), vcpu_count as usize);
     }
 

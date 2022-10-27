@@ -84,6 +84,7 @@ mod tests {
             smt: Some(false),
             cpu_template: Some(CpuFeaturesTemplate::None),
             track_dirty_pages: Some(false),
+            hugepages: Some(false),
         };
 
         match vmm_action_from_request(parse_put_machine_config(&Body::new(body)).unwrap()) {
@@ -103,6 +104,7 @@ mod tests {
             smt: Some(false),
             cpu_template: Some(CpuFeaturesTemplate::None),
             track_dirty_pages: Some(true),
+            hugepages: Some(false),
         };
 
         match vmm_action_from_request(parse_put_machine_config(&Body::new(body)).unwrap()) {
@@ -128,6 +130,7 @@ mod tests {
                 smt: Some(false),
                 cpu_template: Some(CpuFeaturesTemplate::T2),
                 track_dirty_pages: Some(true),
+                hugepages: Some(false),
             };
 
             match vmm_action_from_request(parse_put_machine_config(&Body::new(body)).unwrap()) {
@@ -157,6 +160,7 @@ mod tests {
                 smt: Some(true),
                 cpu_template: Some(CpuFeaturesTemplate::None),
                 track_dirty_pages: Some(true),
+                hugepages: Some(false),
             };
 
             match vmm_action_from_request(parse_put_machine_config(&Body::new(body)).unwrap()) {

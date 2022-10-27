@@ -15,16 +15,41 @@ mod mptable;
 pub mod msr;
 /// Logic for configuring x86_64 registers.
 pub mod regs;
+/// Logic for SEV
+pub mod sev;
 
 use linux_loader::configurator::linux::LinuxBootConfigurator;
 use linux_loader::configurator::{BootConfigurator, BootParams};
 use linux_loader::loader::bootparam::boot_params;
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use linux_loader::loader::elf::start_info::{
+    hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
+};
+use vm_memory::{
+    Address, ByteValued, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
+};
 
+use crate::x86_64::sev::{CPUID_PAGE_ADDR, CPUID_PAGE_LEN, SECRETS_PAGE_ADDR, SECRETS_PAGE_LEN};
 use crate::InitrdConfig;
+
+use self::sev::Sev;
 
 // Value taken from https://elixir.bootlin.com/linux/v5.10.68/source/arch/x86/include/uapi/asm/e820.h#L31
 const E820_RAM: u32 = 1;
+const E820_RESERVED: u32 = 2;
+
+#[derive(Copy, Clone, Default)]
+struct StartInfoWrapper(hvm_start_info);
+
+#[derive(Copy, Clone, Default)]
+struct MemmapTableEntryWrapper(hvm_memmap_table_entry);
+
+#[derive(Copy, Clone, Default)]
+struct ModlistEntryWrapper(hvm_modlist_entry);
+
+// SAFETY: These data structures only contain a series of integers
+unsafe impl ByteValued for StartInfoWrapper {}
+unsafe impl ByteValued for MemmapTableEntryWrapper {}
+unsafe impl ByteValued for ModlistEntryWrapper {}
 
 /// Errors thrown while configuring x86_64 system.
 #[derive(Debug, PartialEq, Eq, derive_more::From)]
@@ -37,6 +62,16 @@ pub enum Error {
     ZeroPageSetup,
     /// Failed to compute initrd address.
     InitrdAddress,
+    /// Error writing module entry to guest memory.
+    ModlistSetup,
+    /// not enough memory for mmap table
+    MemmapTablePastRamEnd,
+    /// Error writing memmap table entry.
+    MemmapTableSetup,
+    /// PVH start info past end of memory
+    StartInfoPastRamEnd,
+    /// Error writing start info to guest memory.
+    StartInfoSetup,
 }
 
 // Where BIOS/VGA magic would live on a real PC.
@@ -98,6 +133,7 @@ pub fn initrd_load_addr(guest_mem: &GuestMemoryMmap, initrd_size: usize) -> supe
 /// * `initrd` - Information about where the ramdisk image was loaded in the `guest_mem`.
 /// * `num_cpus` - Number of virtual CPUs the guest will have.
 pub fn configure_system(
+    sev: &mut Option<Sev>,
     guest_mem: &GuestMemoryMmap,
     cmdline_addr: GuestAddress,
     cmdline_size: usize,
@@ -113,9 +149,9 @@ pub fn configure_system(
 
     let himem_start = GuestAddress(layout::HIMEM_START);
 
-    // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
-    mptable::setup_mptable(guest_mem, num_cpus)?;
+    mptable::setup_mptable(guest_mem, num_cpus, sev)?;
 
+    // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
     let mut params = boot_params::default();
 
     params.hdr.type_of_loader = KERNEL_LOADER_OTHER;
@@ -163,11 +199,33 @@ pub fn configure_system(
         }
     }
 
-    LinuxBootConfigurator::write_bootparams(
-        &BootParams::new(&params, GuestAddress(layout::ZERO_PAGE_START)),
-        guest_mem,
-    )
-    .map_err(|_| Error::ZeroPageSetup)
+    if sev.is_some() {
+        add_e820_entry(
+            &mut params,
+            SECRETS_PAGE_ADDR.0,
+            SECRETS_PAGE_LEN.into(),
+            E820_RESERVED,
+        )?;
+        add_e820_entry(
+            &mut params,
+            CPUID_PAGE_ADDR.0,
+            CPUID_PAGE_LEN.into(),
+            E820_RESERVED,
+        )?;
+    }
+
+    let boot_params = BootParams::new(&params, GuestAddress(layout::ZERO_PAGE_START));
+
+    let result = LinuxBootConfigurator::write_bootparams(&boot_params, guest_mem)
+        .map_err(|_| Error::ZeroPageSetup);
+
+    if let Some(sev) = sev {
+        let len = boot_params.header.len();
+        sev.add_ram_regions(&params.e820_table, params.e820_entries.into());
+        sev.add_measured_region(boot_params.header_start, len as u64);
+    }
+
+    result
 }
 
 /// Add an e820 region to the e820 map.
@@ -218,7 +276,7 @@ mod tests {
         let gm =
             vm_memory::test_utils::create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false)
                 .unwrap();
-        let config_err = configure_system(&gm, GuestAddress(0), 0, &None, 1);
+        let config_err = configure_system(&mut None, &gm, GuestAddress(0), 0, &None, 1);
         assert!(config_err.is_err());
         assert_eq!(
             config_err.unwrap_err(),
@@ -229,19 +287,19 @@ mod tests {
         let mem_size = 128 << 20;
         let arch_mem_regions = arch_memory_regions(mem_size);
         let gm = vm_memory::test_utils::create_anon_guest_memory(&arch_mem_regions, false).unwrap();
-        configure_system(&gm, GuestAddress(0), 0, &None, no_vcpus).unwrap();
+        configure_system(&mut None, &gm, GuestAddress(0), 0, &None, no_vcpus).unwrap();
 
         // Now assigning some memory that is equal to the start of the 32bit memory hole.
         let mem_size = 3328 << 20;
         let arch_mem_regions = arch_memory_regions(mem_size);
         let gm = vm_memory::test_utils::create_anon_guest_memory(&arch_mem_regions, false).unwrap();
-        configure_system(&gm, GuestAddress(0), 0, &None, no_vcpus).unwrap();
+        configure_system(&mut None, &gm, GuestAddress(0), 0, &None, no_vcpus).unwrap();
 
         // Now assigning some memory that falls after the 32bit memory hole.
         let mem_size = 3330 << 20;
         let arch_mem_regions = arch_memory_regions(mem_size);
         let gm = vm_memory::test_utils::create_anon_guest_memory(&arch_mem_regions, false).unwrap();
-        configure_system(&gm, GuestAddress(0), 0, &None, no_vcpus).unwrap();
+        configure_system(&mut None, &gm, GuestAddress(0), 0, &None, no_vcpus).unwrap();
     }
 
     #[test]

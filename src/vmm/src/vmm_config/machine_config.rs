@@ -75,6 +75,9 @@ pub struct VmConfig {
     /// Enables or disables dirty page tracking. Enabling allows incremental snapshots.
     #[serde(default)]
     pub track_dirty_pages: bool,
+    /// Enables or disables huge pages.
+    #[serde(default)]
+    pub hugepages: bool,
 }
 
 impl Default for VmConfig {
@@ -85,6 +88,7 @@ impl Default for VmConfig {
             smt: false,
             cpu_template: CpuFeaturesTemplate::None,
             track_dirty_pages: false,
+            hugepages: false,
         }
     }
 }
@@ -94,8 +98,13 @@ impl fmt::Display for VmConfig {
         write!(
             f,
             "{{ \"vcpu_count\": {:?}, \"mem_size_mib\": {:?}, \"smt\": {:?}, \"cpu_template\": \
-             {:?}, \"track_dirty_pages\": {:?} }}",
-            self.vcpu_count, self.mem_size_mib, self.smt, self.cpu_template, self.track_dirty_pages
+             {:?}, \"track_dirty_pages\": {:?}, \"huge_pages\": {:?} }}",
+            self.vcpu_count,
+            self.mem_size_mib,
+            self.smt,
+            self.cpu_template,
+            self.track_dirty_pages,
+            self.hugepages
         )
     }
 }
@@ -135,6 +144,10 @@ pub struct VmUpdateConfig {
     /// Enables or disables dirty page tracking. Enabling allows incremental snapshots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_dirty_pages: Option<bool>,
+
+    /// Enables or disables hugepages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hugepages: Option<bool>,
 }
 
 impl VmUpdateConfig {
@@ -147,6 +160,7 @@ impl VmUpdateConfig {
             && self.cpu_template.is_none()
             && self.smt.is_none()
             && self.track_dirty_pages.is_none()
+            && self.hugepages.is_none()
         {
             return true;
         }
@@ -163,6 +177,7 @@ impl From<VmConfig> for VmUpdateConfig {
             smt: Some(cfg.smt),
             cpu_template: Some(cfg.cpu_template),
             track_dirty_pages: Some(cfg.track_dirty_pages),
+            hugepages: Some(cfg.hugepages),
         }
     }
 }

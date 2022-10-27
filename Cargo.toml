@@ -10,4 +10,5 @@ panic = "abort"
 lto = true
 
 [patch.crates-io]
-kvm-bindings = { git = "https://github.com/firecracker-microvm/kvm-bindings", tag = "v0.5.0-1", features = ["fam-wrappers"] }
+kvm-bindings = { git = "https://github.com/bencw12/kvm-bindings", branch = "snp-host-v0.5.0-1", features = ["fam-wrappers"]}
+kvm-ioctls = { git = "https://github.com/bencw12/kvm-ioctls", branch = "snp-host-5.19-fix" }

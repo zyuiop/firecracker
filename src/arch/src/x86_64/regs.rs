@@ -100,7 +100,13 @@ impl fmt::Display for SetupRegistersError {
 /// # Errors
 ///
 /// When [`kvm_ioctls::ioctls::vcpu::VcpuFd::set_regs`] errors.
-pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64) -> std::result::Result<(), SetupRegistersError> {
+pub fn setup_regs(
+    vcpu: &VcpuFd,
+    boot_ip: u64,
+    kernel_len: u64,
+    initrd_len: u64,
+    initrd_load_addr: u64,
+) -> std::result::Result<(), SetupRegistersError> {
     let regs: kvm_regs = kvm_regs {
         rflags: 0x0000_0000_0000_0002u64,
         rip: boot_ip,
@@ -113,6 +119,10 @@ pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64) -> std::result::Result<(), SetupR
         rbp: super::layout::BOOT_STACK_POINTER as u64,
         // Must point to zero page address per Linux ABI. This is x86_64 specific.
         rsi: super::layout::ZERO_PAGE_START as u64,
+        rbx: super::layout::PVH_INFO_START as u64,
+        rcx: kernel_len,
+        r14: initrd_len,
+        r15: initrd_load_addr,
         ..Default::default()
     };
 
@@ -153,14 +163,19 @@ pub enum SetupSpecialRegistersError {
 pub fn setup_sregs(
     mem: &GuestMemoryMmap,
     vcpu: &VcpuFd,
+    sev: bool,
 ) -> std::result::Result<(), SetupSpecialRegistersError> {
     let mut sregs: kvm_sregs = vcpu
         .get_sregs()
         .map_err(SetupSpecialRegistersError::GetSpecialRegisters)?;
 
-    configure_segments_and_sregs(mem, &mut sregs)
+    configure_segments_and_sregs(mem, &mut sregs, sev)
         .map_err(SetupSpecialRegistersError::ConfigureSegmentsAndSpecialRegisters)?;
-    setup_page_tables(mem, &mut sregs).map_err(SetupSpecialRegistersError::SetupPageTables)?; // TODO(dgreid) - Can this be done once per system instead?
+
+    if !sev {
+        setup_page_tables(mem, &mut sregs).map_err(SetupSpecialRegistersError::SetupPageTables)?;
+        // TODO(dgreid) - Can this be done once per system instead?
+    }
 
     vcpu.set_sregs(&sregs)
         .map_err(SetupSpecialRegistersError::SetSpecialRegisters)
@@ -198,13 +213,27 @@ fn write_idt_value(val: u64, guest_mem: &GuestMemoryMmap) -> Result<()> {
         .map_err(|_| Error::WriteIDT)
 }
 
-fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()> {
-    let gdt_table: [u64; BOOT_GDT_MAX as usize] = [
-        gdt_entry(0, 0, 0),            // NULL
-        gdt_entry(0xa09b, 0, 0xfffff), // CODE
-        gdt_entry(0xc093, 0, 0xfffff), // DATA
-        gdt_entry(0x808b, 0, 0xfffff), // TSS
-    ];
+fn configure_segments_and_sregs(
+    mem: &GuestMemoryMmap,
+    sregs: &mut kvm_sregs,
+    sev: bool,
+) -> Result<()> {
+    let gdt_table: [u64; BOOT_GDT_MAX as usize] = if sev {
+        [
+            // Configure GDT entries as specified by PVH boot protocol (from cloud hypervisor)
+            gdt_entry(0, 0, 0),               // NULL
+            gdt_entry(0xc09b, 0, 0xffffffff), // CODE
+            gdt_entry(0xc093, 0, 0xffffffff), // DATA
+            gdt_entry(0x008b, 0, 0x67),       // TSS
+        ]
+    } else {
+        [
+            gdt_entry(0, 0, 0),            // NULL
+            gdt_entry(0xa09b, 0, 0xfffff), // CODE
+            gdt_entry(0xc093, 0, 0xfffff), // DATA
+            gdt_entry(0x808b, 0, 0xfffff), // TSS
+        ]
+    };
 
     let code_seg = kvm_segment_from_gdt(gdt_table[1], 1);
     let data_seg = kvm_segment_from_gdt(gdt_table[2], 2);
@@ -227,9 +256,13 @@ fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) ->
     sregs.ss = data_seg;
     sregs.tr = tss_seg;
 
-    // 64-bit protected mode
-    sregs.cr0 |= X86_CR0_PE;
-    sregs.efer |= EFER_LME | EFER_LMA;
+    if sev {
+        sregs.cr0 = X86_CR0_PE;
+    } else {
+        // 64-bit protected mode
+        sregs.cr0 |= X86_CR0_PE;
+        sregs.efer |= EFER_LME | EFER_LMA;
+    }
 
     Ok(())
 }
@@ -356,7 +389,7 @@ mod tests {
             ..Default::default()
         };
 
-        setup_regs(&vcpu, expected_regs.rip).unwrap();
+        setup_regs(&vcpu, expected_regs.rip, 0, 0, 0).unwrap();
 
         let actual_regs: kvm_regs = vcpu.get_regs().unwrap();
         assert_eq!(actual_regs, expected_regs);
@@ -370,7 +403,7 @@ mod tests {
         let gm = create_guest_mem(None);
 
         assert!(vcpu.set_sregs(&Default::default()).is_ok());
-        setup_sregs(&gm, &vcpu).unwrap();
+        setup_sregs(&gm, &vcpu, false).unwrap();
 
         let mut sregs: kvm_sregs = vcpu.get_sregs().unwrap();
         // for AMD KVM_GET_SREGS returns g = 0 for each kvm_segment.
@@ -423,7 +456,7 @@ mod tests {
     fn test_configure_segments_and_sregs() {
         let mut sregs: kvm_sregs = Default::default();
         let gm = create_guest_mem(None);
-        configure_segments_and_sregs(&gm, &mut sregs).unwrap();
+        configure_segments_and_sregs(&gm, &mut sregs, false).unwrap();
 
         validate_segments_and_sregs(&gm, &sregs);
     }

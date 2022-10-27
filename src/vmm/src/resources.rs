@@ -22,6 +22,7 @@ use crate::vmm_config::machine_config::{VmConfig, VmConfigError, VmUpdateConfig}
 use crate::vmm_config::metrics::{init_metrics, MetricsConfig, MetricsConfigError};
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::*;
+use crate::vmm_config::sev_config::SevConfig;
 use crate::vmm_config::vsock::*;
 use crate::vstate::vcpu::VcpuConfig;
 
@@ -52,6 +53,8 @@ pub enum Error {
     VmConfig(VmConfigError),
     /// Vsock device configuration error.
     VsockDevice(VsockConfigError),
+    /// SEV config error
+    Sev,
 }
 
 impl std::fmt::Display for Error {
@@ -68,6 +71,7 @@ impl std::fmt::Display for Error {
             Error::NetDevice(err) => write!(f, "Network device error: {}", err),
             Error::VmConfig(err) => write!(f, "VM config error: {}", err),
             Error::VsockDevice(err) => write!(f, "Vsock device error: {}", err),
+            Error::Sev => write!(f, "SEV config error"),
         }
     }
 }
@@ -93,6 +97,8 @@ pub struct VmmConfig {
     net_devices: Vec<NetworkInterfaceConfig>,
     #[serde(rename = "vsock")]
     vsock_device: Option<VsockDeviceConfig>,
+    #[serde(rename = "sev-config")]
+    sev_config: Option<SevConfig>,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -119,6 +125,8 @@ pub struct VmResources {
     pub mmds_size_limit: usize,
     /// Whether or not to load boot timer device.
     pub boot_timer: bool,
+    /// SEV manager
+    pub sev: Option<SevConfig>,
 }
 
 impl VmResources {
@@ -146,6 +154,10 @@ impl VmResources {
         if let Some(machine_config) = vmm_config.machine_config {
             let machine_config = VmUpdateConfig::from(machine_config);
             resources.update_vm_config(&machine_config)?;
+        }
+
+        if let Some(sev_config) = vmm_config.sev_config {
+            resources.sev = Some(sev_config);
         }
 
         resources.build_boot_source(vmm_config.boot_source)?;
@@ -233,6 +245,11 @@ impl VmResources {
         self.vm_config().track_dirty_pages
     }
 
+    /// Returns whether dirty page tracking is enabled or not.
+    pub fn hugepages(&self) -> bool {
+        self.vm_config().hugepages
+    }
+
     /// Configures the dirty page tracking functionality of the microVM.
     pub fn set_track_dirty_pages(&mut self, dirty_page_tracking: bool) {
         self.vm_config.track_dirty_pages = dirty_page_tracking;
@@ -298,6 +315,10 @@ impl VmResources {
         // Update dirty page tracking
         if let Some(track_dirty_pages) = machine_config.track_dirty_pages {
             self.vm_config.track_dirty_pages = track_dirty_pages;
+        }
+
+        if let Some(hugepages) = machine_config.hugepages {
+            self.vm_config.hugepages = hugepages;
         }
 
         Ok(())
@@ -488,6 +509,7 @@ impl From<&VmResources> for VmmConfig {
             mmds_config: resources.mmds_config(),
             net_devices: resources.net_builder.configs(),
             vsock_device: resources.vsock.config(),
+            sev_config: resources.sev.clone(),
         }
     }
 }
@@ -589,6 +611,7 @@ mod tests {
             mmds: None,
             boot_timer: false,
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
+            sev: None,
         }
     }
 
@@ -1291,6 +1314,7 @@ mod tests {
             smt: Some(true),
             cpu_template: Some(CpuFeaturesTemplate::T2),
             track_dirty_pages: Some(false),
+            hugepages: Some(false),
         };
 
         assert_ne!(

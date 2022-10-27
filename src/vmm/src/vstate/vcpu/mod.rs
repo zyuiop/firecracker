@@ -14,7 +14,7 @@ use std::sync::{Arc, Barrier};
 use std::{fmt, io, result, thread};
 
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
-use kvm_ioctls::VcpuExit;
+use kvm_ioctls::{VcpuExit, VmFd};
 use libc::{c_int, c_void, siginfo_t};
 use logger::{error, info, IncMetric, METRICS};
 use seccompiler::{BpfProgram, BpfProgramRef};
@@ -22,6 +22,7 @@ use utils::errno;
 use utils::eventfd::EventFd;
 use utils::signal::{register_signal_handler, sigrtmin, Killable};
 use utils::sm::StateMachine;
+use vm_memory::GuestMemoryMmap;
 
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use crate::vstate::vm::Vm;
@@ -96,6 +97,8 @@ impl fmt::Display for StartThreadedError {
 pub struct Vcpu {
     // Offers kvm-arch specific functionality.
     pub kvm_vcpu: KvmVcpu,
+    pub vm_fd: Arc<VmFd>,
+    pub guest_memory: GuestMemoryMmap,
 
     // File descriptor for vcpu to trigger exit event on vmm.
     exit_evt: EventFd,
@@ -203,7 +206,12 @@ impl Vcpu {
     /// * `index` - Represents the 0-based CPU index between [0, max vcpus).
     /// * `vm` - The vm to which this vcpu will get attached.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
-    pub fn new(index: u8, vm: &Vm, exit_evt: EventFd) -> Result<Self> {
+    pub fn new(
+        index: u8,
+        vm: &Vm,
+        exit_evt: EventFd,
+        guest_memory: &GuestMemoryMmap,
+    ) -> Result<Self> {
         let (event_sender, event_receiver) = channel();
         let (response_sender, response_receiver) = channel();
         let kvm_vcpu = KvmVcpu::new(index, vm).unwrap();
@@ -215,6 +223,8 @@ impl Vcpu {
             response_receiver: Some(response_receiver),
             response_sender,
             kvm_vcpu,
+            vm_fd: vm.fd(),
+            guest_memory: guest_memory.clone(),
             #[cfg(test)]
             test_vcpu_exit_reason: Mutex::new(None),
         })
@@ -505,7 +515,11 @@ impl Vcpu {
                 },
                 arch_specific_reason => {
                     // run specific architecture emulation.
-                    self.kvm_vcpu.run_arch_emulation(arch_specific_reason)
+                    self.kvm_vcpu.run_arch_emulation(
+                        arch_specific_reason,
+                        &self.vm_fd,
+                        &self.guest_memory,
+                    )
                 }
             },
             // The unwrap on raw_os_error can only fail if we have a logic
@@ -530,7 +544,7 @@ impl Vcpu {
                     }
                     _ => {
                         METRICS.vcpu.failures.inc();
-                        error!("Failure during vcpu run: {}", err);
+                        error!("Failure during vcpu run: {}", err.errno());
                         Err(Error::FaultyKvmExit(format!("{}", err)))
                     }
                 }
@@ -862,7 +876,7 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         {
             vm.setup_irqchip().unwrap();
-            vcpu = Vcpu::new(1, &vm, exit_evt).unwrap();
+            vcpu = Vcpu::new(1, &vm, exit_evt, &gm).unwrap();
         }
         (vm, vcpu, gm)
     }
@@ -923,6 +937,8 @@ mod tests {
                     entry_addr,
                     &vcpu_config,
                     _vm.supported_cpuid().clone(),
+                    false,
+                    0,
                 )
                 .expect("failed to configure vcpu");
         }

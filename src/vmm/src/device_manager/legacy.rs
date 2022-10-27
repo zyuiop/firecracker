@@ -182,6 +182,6 @@ mod tests {
             EventFd::new(libc::EFD_NONBLOCK).unwrap(),
         )
         .unwrap();
-        assert!(ldm.register_devices(vm.fd()).is_ok());
+        assert!(ldm.register_devices(&vm.fd()).is_ok());
     }
 }

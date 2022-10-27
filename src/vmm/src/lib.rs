@@ -33,14 +33,17 @@ pub mod vmm_config;
 mod vstate;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 use std::{fmt, io};
 
-use arch::DeviceType;
+use arch::x86_64::sev::Sev;
+use arch::{DeviceType, InitrdConfig};
 use devices::legacy::serial::{IER_RDA_BIT, IER_RDA_OFFSET};
+use devices::pseudo::KernelType;
 use devices::virtio::balloon::Error as BalloonError;
 use devices::virtio::{
     Balloon, BalloonConfig, BalloonStats, Block, MmioTransport, Net, BALLOON_DEV_ID, TYPE_BALLOON,
@@ -127,6 +130,14 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     #[error("Error creating legacy device: {0}")]
     CreateLegacyDevice(device_manager::legacy::Error),
+    /// Error setting up SEV
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error setting up SEV boot: {0}")]
+    SevSetup(arch::x86_64::sev::SevError),
+    /// Error finishing up SEV
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error finishihng SEV boot: {0}")]
+    SevFinish(arch::x86_64::sev::SevError),
     /// Device manager error.
     #[error("{0}")]
     DeviceManager(device_manager::mmio::Error),
@@ -298,6 +309,9 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+
+    #[cfg(target_arch = "x86_64")]
+    sev: Option<Sev>,
 }
 
 impl Vmm {
@@ -582,7 +596,7 @@ impl Vmm {
         // example, if this function were to be exposed through the VMM controller, the VMM
         // resources should cache the flag.
         self.vm
-            .set_kvm_memory_regions(&self.guest_memory, enable)
+            .set_kvm_memory_regions(&self.guest_memory, enable, false)
             .map_err(Error::Vm)
     }
 
@@ -628,6 +642,57 @@ impl Vmm {
                 Ok(())
             })
             .map_err(Error::DeviceManager)
+    }
+
+    /// Initializes SEV
+    pub fn setup_sev(
+        &mut self,
+        fw_path: &String,
+        mut kernel_file: File,
+        kernel_type: KernelType,
+        initrd: &Option<InitrdConfig>,
+    ) -> Result<u64> {
+        if let Some(sev) = self.sev.as_mut() {
+            sev.load_firmware(fw_path, &self.guest_memory)
+                .map_err(|err| Error::SevSetup(err))?;
+
+            sev.snp_insert_cpuid_page(&self.guest_memory, self.vm.supported_cpuid().as_slice())
+                .map_err(|err| Error::SevSetup(err))?;
+
+            sev.snp_insert_secrets_page(&self.guest_memory)
+                .map_err(|err| Error::SevSetup(err))?;
+
+            return Ok(sev
+                .load_kernel_and_initrd(
+                    &mut kernel_file,
+                    kernel_type == KernelType::BzImage,
+                    &self.guest_memory,
+                    initrd,
+                )
+                .map_err(|err| Error::SevSetup(err))?);
+        }
+        Ok(0u64)
+    }
+
+    /// Finishes SEV boot
+    pub fn finish_sev(&mut self) -> Result<()> {
+        if let Some(sev) = self.sev.as_mut() {
+            sev.measure_regions(&self.guest_memory)
+                .map_err(|err| Error::SevFinish(err))?;
+
+            if sev.snp {
+                sev.snp_launch_finish()
+                    .map_err(|err| Error::SevFinish(err))?;
+            } else {
+                sev.launch_update_vmsa()
+                    .map_err(|err| Error::SevFinish(err))?;
+                sev.get_launch_measurement()
+                    .map_err(|err| Error::SevFinish(err))?;
+                sev.sev_launch_finish()
+                    .map_err(|err| Error::SevFinish(err))?;
+            }
+        }
+        Ok(())
     }
 
     /// Returns a reference to the balloon device if present.

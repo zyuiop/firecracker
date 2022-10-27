@@ -29,6 +29,8 @@ pub mod metrics;
 pub mod mmds;
 /// Wrapper for configuring the network devices attached to the microVM.
 pub mod net;
+/// Wrapper for configuring SEV
+pub mod sev_config;
 /// Wrapper for configuring microVM snapshots and the microVM state.
 pub mod snapshot;
 /// Wrapper for configuring the vsock devices attached to the microVM.
