@@ -398,9 +398,9 @@ impl BusDevice for FwCfg {
                         &(self.dyn_syms.len() as u64).to_le_bytes()
                     );
 
-                    let dyn_sym_slice = [0u8; sym64::SIZEOF_SYM];
+                    let mut dyn_sym_slice = [0u8; sym64::SIZEOF_SYM];
                     for sym in self.dyn_syms.iter() {
-                        sym.try_into_ctx(&mut output, Endian::Little).expect("failed to serialize symbol");
+                        sym.try_into_ctx(&mut dyn_sym_slice, Endian::Little).expect("failed to serialize symbol");
                         output.extend_from_slice(&dyn_sym_slice);
                     }
 
@@ -409,9 +409,9 @@ impl BusDevice for FwCfg {
                         &(self.rela.len() as u64).to_le_bytes()
                     );
 
-                    let rela_slice = [0u8; reloc64::SIZEOF_RELA];
+                    let mut rela_slice = [0u8; reloc64::SIZEOF_RELA];
                     for reloc in self.rela.iter() {
-                        reloc.try_into_ctx(&mut output, Endian::Little).expect("failed to serialize reloc");
+                        reloc.try_into_ctx(&mut rela_slice, Endian::Little).expect("failed to serialize reloc");
                         output.extend_from_slice(&rela_slice);
                     }
 
