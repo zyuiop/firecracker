@@ -14,6 +14,9 @@ versionize_derive = ">=0.1.3"
 vm-superio = ">=0.4.0"
 derive_more = { version = "0.99.17", default-features = false, features = ["from"] }
 linux-loader = { version = ">=0.4.0", features = ["elf", "bzimage"] }
+goblin = { version = "0.9.3", features = ["elf64", "alloc", "std"] }
+plain = "0.2.3"
+scroll = "0.12.0"
 
 dumbo = { path = "../dumbo" }
 logger = { path = "../logger" }

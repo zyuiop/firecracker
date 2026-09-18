@@ -5,13 +5,22 @@ use std::{
     io::{Read, Seek, SeekFrom},
     mem,
 };
-
+use std::mem::size_of;
+use std::os::unix::fs::MetadataExt;
+use goblin::{elf, elf64};
+use goblin::container::{Container, Ctx};
 use arch::x86_64::sev::Sev;
-use linux_loader::{
-    bootparam::setup_header,
-    elf::{self, elf64_hdr, elf64_phdr},
-};
-use linux_loader::elf::PT_LOAD;
+use linux_loader::{bootparam::setup_header, elf as elf_magic};
+use goblin::elf::{dynamic, Elf, ProgramHeaders, Reloc, Sym};
+use goblin::elf::program_header::ProgramHeader;
+use goblin::elf64::header::{Header as Elf64Header, SIZEOF_EHDR};
+use goblin::elf64::reloc::{Rela, SIZEOF_RELA};
+use goblin::elf64::sym::sym64;
+use goblin::elf::dynamic::DynamicInfo;
+use goblin::elf::program_header::{PT_DYNAMIC, PT_LOAD};
+use goblin::elf::reloc::reloc64;
+use scroll::ctx::TryIntoCtx;
+use scroll::Endian;
 use logger::{info, warn};
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -56,6 +65,9 @@ enum Command {
     PhdrData,
     ///Start reading loadable segment data
     SegData,
+    ///For a direct boot, send the Relocation data
+    ElfRela,
+    ElfDynSym,
 }
 
 #[derive(Debug, PartialEq)]
@@ -104,6 +116,8 @@ impl TryFrom<u8> for Command {
             3 => Ok(Self::ElfHdr),
             4 => Ok(Self::PhdrData),
             5 => Ok(Self::SegData),
+            6 => Ok(Self::ElfRela),
+            7 => Ok(Self::ElfDynSym),
             _ => Err(Error::InvalidCommand),
         }
     }
@@ -118,6 +132,8 @@ impl Into<u32> for Command {
             Self::ElfHdr => 3,
             Self::PhdrData => 4,
             Self::SegData => 5,
+            Self::ElfRela => 6,
+            Self::ElfDynSym => 7,
         }
     }
 }
@@ -133,11 +149,14 @@ impl KernelType {
 
 pub struct FwCfg {
     mem: GuestMemoryMmap,
-    kernel: File,
+    kernel: Vec<u8>,
     kernel_type: KernelType,
-    kernel_len: u64,
-    ehdr: Option<elf64_hdr>,
-    phdrs: Option<Vec<elf64_phdr>>,
+    ehdr: Option<Elf64Header>,
+    phdrs: Option<Vec<ProgramHeader>>,
+
+    rela: Vec<reloc64::Rela>,
+    dyn_syms: Vec<sym64::Sym>,
+
     cur_phdr: usize,
     seg_pos: u64,
     cmd: Option<Command>,
@@ -155,18 +174,21 @@ impl FwCfg {
         info!("Creating fw_cfg device");
 
         let kernel_type = get_kernel_type(&mut kernel);
+        let mut kernel_data = Vec::with_capacity(kernel.metadata().map(|meta| meta.size() as usize).unwrap_or(1024));
+        kernel.read_to_end(&mut kernel_data).expect("Failed to read kernel data");
 
         let mut fw_cfg = FwCfg {
             mem,
-            kernel,
-            kernel_len: 0,
+            kernel: kernel_data,
             kernel_type,
             ehdr: None,
             phdrs: None,
+            rela: vec![],
             cmd: None,
             cur_phdr: 0,
             seg_pos: 0,
             state: State::WriteElfHdr,
+            dyn_syms: vec![],
         };
 
         //Try to parallelize this somehow in the future
@@ -174,8 +196,6 @@ impl FwCfg {
             fw_cfg.setup_direct_boot().unwrap();
             assert!(fw_cfg.phdrs.is_some());
             assert!(!fw_cfg.phdrs.as_ref().unwrap().is_empty());
-        } else {
-            fw_cfg.get_bzimage_size().unwrap();
         }
 
         fw_cfg.add_kernel_hashes(kernel_hashes_path, initrd_hashes_path, sev);
@@ -219,67 +239,42 @@ impl FwCfg {
 
     ///Parse uncompressed kernel ELF and save loadable phdrs/entry point
     fn setup_direct_boot(&mut self) -> Result<(), Error> {
-        self.kernel
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| Error::SeekKernelStart)?;
+        let elf = Elf::parse(&self.kernel).expect("failed to parse ELF");
 
-        let mut ehdr = elf::Elf64_Ehdr::default();
-        ehdr.as_bytes()
-            .read_from(0, &mut self.kernel, mem::size_of::<elf::Elf64_Ehdr>())
-            .map_err(|_| Error::ReadKernelDataStruct("Failed to read ELF header"))?;
-
+        let ehdr = elf.header;
         // Sanity checks
-        if ehdr.e_ident[elf::EI_MAG0 as usize] != elf::ELFMAG0 as u8
-            || ehdr.e_ident[elf::EI_MAG1 as usize] != elf::ELFMAG1
-            || ehdr.e_ident[elf::EI_MAG2 as usize] != elf::ELFMAG2
-            || ehdr.e_ident[elf::EI_MAG3 as usize] != elf::ELFMAG3
+        if ehdr.e_ident[elf_magic::EI_MAG0 as usize] != elf_magic::ELFMAG0 as u8
+            || ehdr.e_ident[elf_magic::EI_MAG1 as usize] != elf_magic::ELFMAG1
+            || ehdr.e_ident[elf_magic::EI_MAG2 as usize] != elf_magic::ELFMAG2
+            || ehdr.e_ident[elf_magic::EI_MAG3 as usize] != elf_magic::ELFMAG3
         {
             return Err(Error::InvalidElfMagicNumber);
         }
-        if ehdr.e_ident[elf::EI_DATA as usize] != elf::ELFDATA2LSB as u8 {
+        if ehdr.e_ident[elf_magic::EI_DATA as usize] != elf_magic::ELFDATA2LSB as u8 {
             return Err(Error::BigEndianElfOnLittle);
         }
-        if ehdr.e_phentsize as usize != mem::size_of::<elf::Elf64_Phdr>() {
+        if ehdr.e_phentsize as usize != mem::size_of::<ProgramHeader>() {
             return Err(Error::InvalidProgramHeaderSize);
         }
-        if (ehdr.e_phoff as usize) < mem::size_of::<elf::Elf64_Ehdr>() {
+        if (ehdr.e_phoff as usize) < mem::size_of::<ProgramHeader>() {
             // If the program header is backwards, bail.
             return Err(Error::InvalidProgramHeaderOffset);
         }
 
-        self.kernel
-            .seek(SeekFrom::Start(ehdr.e_phoff))
-            .map_err(|_| Error::SeekProgramHeader)?;
+        let mut phdrs = elf.program_headers;
 
-        let mut phdrs = Vec::new();
+        self.rela = elf.dynrelas
+            .iter()
+            .map(|rela| reloc64::Rela::from(rela))
+            .collect();
 
-        let phdr_sz = mem::size_of::<elf::Elf64_Phdr>();
-        for _ in 0usize..ehdr.e_phnum as usize {
-            let mut phdr = elf::Elf64_Phdr::default();
-            phdr.as_bytes()
-                .read_from(0, &mut self.kernel, phdr_sz)
-                .map_err(|_| Error::ReadKernelDataStruct("Failed to read ELF program header"))?;
+        self.dyn_syms = elf.dynsyms
+            .iter()
+            .map(|sym| sym64::Sym::from(sym))
+            .collect();
 
-            phdrs.push(phdr);
-        }
-
-        self.ehdr = Some(ehdr.clone());
-        self.phdrs = Some(phdrs.clone());
-
-        Ok(())
-    }
-
-    fn get_bzimage_size(&mut self) -> Result<(), Error> {
-        self.kernel
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| Error::SeekKernelStart)?;
-        self.kernel_len = self
-            .kernel
-            .seek(SeekFrom::End(0))
-            .map_err(|_| Error::SeekKernelImage)?;
-        self.kernel
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| Error::SeekKernelStart)?;
+        self.ehdr = Some(ehdr.into());
+        self.phdrs = Some(phdrs);
 
         Ok(())
     }
@@ -309,10 +304,14 @@ impl BusDevice for FwCfg {
                 }
                 Some(Command::ElfHdr) => {
                     if self.state == State::WriteElfHdr {
-                        //Elf header is small so it can all be written in one chunk
+                        // Elf header is small so it can all be written in one chunk
+                        let mut output = [0u8; elf64::header::SIZEOF_EHDR];
+                        self.ehdr.unwrap().try_into_ctx(&mut output, Endian::Little)
+                            .expect("failed to read Elf HDR");
+
                         self.mem
                             .write_slice(
-                                &self.ehdr.unwrap().as_slice(),
+                                &output,
                                 GuestAddress(DATA_REGION_ADDR),
                             )
                             .unwrap();
@@ -325,13 +324,17 @@ impl BusDevice for FwCfg {
                     if self.state == State::WritePhdrs {
                         if let Some(phdrs) = &mut self.phdrs {
                             let phdr = phdrs.get(self.cur_phdr).unwrap();
+                            let phdr = elf64::program_header::ProgramHeader::from(phdr.clone());
+                            let mut output = [0u8; size_of::<elf64::program_header::ProgramHeader>()];
+                            phdr.try_into_ctx(&mut output, Endian::Little).expect("failed to serialize program header!");
+
                             self.mem
-                                .write_slice(phdr.as_slice(), GuestAddress(DATA_REGION_ADDR))
+                                .write_slice(&output, GuestAddress(DATA_REGION_ADDR))
                                 .unwrap();
 
                             self.cur_phdr += 1;
 
-                            if self.cur_phdr == self.ehdr.unwrap().e_phnum as usize {
+                            if self.cur_phdr == phdrs.len() {
                                 self.cur_phdr = 0;
                                 self.state = State::WriteSegs;
                             }
@@ -347,7 +350,7 @@ impl BusDevice for FwCfg {
                         if let Some(phdrs) = &mut self.phdrs {
                             //Get phdr for segment to write
                             let mut phdr = phdrs.get(self.cur_phdr).unwrap();
-                            if phdr.p_filesz == 0 || (phdr.p_type != PT_LOAD && phdr.p_type != 2 /* PT_DYNAMIC */ && phdr.p_type != 7 /* PT_TLS */) {
+                            if phdr.p_filesz == 0 || phdr.p_type != PT_LOAD {
                                 self.cur_phdr += 1;
                                 if self.cur_phdr >= phdrs.len() {
                                     return;
@@ -362,16 +365,12 @@ impl BusDevice for FwCfg {
                             //Offset is kernel file offset plus last position in segment
                             // let pos = phdr.p_offset + self.seg_pos;
                             //Seek to offset in segment
-                            if self.seg_pos == 0 {
-                                self.kernel.seek(SeekFrom::Start(phdr.p_offset)).unwrap();
-                            }
 
                             //Write segment bytes to data region
                             self.mem
-                                .read_exact_from(
+                                .write_slice(
+                                    &mut self.kernel[phdr.p_offset as usize..][..write_len as usize],
                                     GuestAddress(DATA_REGION_ADDR),
-                                    &mut self.kernel,
-                                    write_len as usize,
                                 )
                                 .unwrap();
                             //Update position in current segment
@@ -388,6 +387,62 @@ impl BusDevice for FwCfg {
                     } else {
                         warn!("Invalid state");
                     }
+                }
+                Some(Command::ElfRela) => {
+                    let mut output = Vec::new();
+
+                    // Dynamic Symbols
+                    output.extend_from_slice(
+                        &(self.dyn_syms.len() as u64).to_le_bytes()
+                    );
+
+                    let dyn_sym_slice = [0u8; sym64::SIZEOF_SYM];
+                    for sym in self.dyn_syms.iter() {
+                        sym.try_into_ctx(&mut output, Endian::Little).expect("failed to serialize symbol");
+                        output.extend_from_slice(&dyn_sym_slice);
+                    }
+
+                    // Relocations
+                    output.extend_from_slice(
+                        &(self.rela.len() as u64).to_le_bytes()
+                    );
+
+                    let rela_slice = [0u8; reloc64::SIZEOF_RELA];
+                    for reloc in self.rela.iter() {
+                        reloc.try_into_ctx(&mut output, Endian::Little).expect("failed to serialize reloc");
+                        output.extend_from_slice(&rela_slice);
+                    }
+
+
+                    if output.len() > DATA_REGION_SIZE as usize {
+                        panic!("too many relocations!");
+                    }
+
+                    self.mem
+                        .write_slice(&output, GuestAddress(DATA_REGION_ADDR))
+                        .unwrap();
+
+                }
+                Some(Command::ElfDynSym) => {
+                    /* let mut output = Vec::new();
+                    output.extend_from_slice(
+                        &(self.dyn_syms.len() as u64).to_le_bytes()
+                    );
+
+                    let dyn_sym_slice = [0u8; sym64::SIZEOF_SYM];
+                    for sym in self.dyn_syms.iter() {
+                        sym.try_into_ctx(&mut output, Endian::Little).expect("failed to serialize symbol");
+                        output.extend_from_slice(&dyn_sym_slice);
+                    }
+
+                    if output.len() > DATA_REGION_SIZE as usize {
+                        panic!("too many dynamic symbols!");
+                    }
+
+                    self.mem
+                        .write_slice(&output, GuestAddress(DATA_REGION_ADDR))
+                        .unwrap(); */
+                    unimplemented!()
                 }
                 // Some(Command::BzImageLen) => {
                 //     if self.state == State::WriteBzImageLen {
