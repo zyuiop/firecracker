@@ -365,13 +365,13 @@ impl BusDevice for FwCfg {
                                 write_len = bytes_left;
                             }
                             //Offset is kernel file offset plus last position in segment
-                            // let pos = phdr.p_offset + self.seg_pos;
+                            let pos = phdr.p_offset + self.seg_pos;
                             //Seek to offset in segment
 
                             //Write segment bytes to data region
                             self.mem
                                 .write_slice(
-                                    &mut self.kernel[phdr.p_offset as usize..][..write_len as usize],
+                                    &mut self.kernel[pos as usize..][..write_len as usize],
                                     GuestAddress(DATA_REGION_ADDR),
                                 )
                                 .unwrap();
