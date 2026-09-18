@@ -175,6 +175,8 @@ impl FwCfg {
 
         let kernel_type = get_kernel_type(&mut kernel);
         let mut kernel_data = Vec::with_capacity(kernel.metadata().map(|meta| meta.size() as usize).unwrap_or(1024));
+
+        kernel.seek(SeekFrom::Start(0)).expect("Unable to seek to start of kernel file");
         kernel.read_to_end(&mut kernel_data).expect("Failed to read kernel data");
 
         let mut fw_cfg = FwCfg {
