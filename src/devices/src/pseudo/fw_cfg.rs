@@ -11,6 +11,7 @@ use linux_loader::{
     bootparam::setup_header,
     elf::{self, elf64_hdr, elf64_phdr},
 };
+use linux_loader::elf::PT_LOAD;
 use logger::{info, warn};
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -346,7 +347,7 @@ impl BusDevice for FwCfg {
                         if let Some(phdrs) = &mut self.phdrs {
                             //Get phdr for segment to write
                             let mut phdr = phdrs.get(self.cur_phdr).unwrap();
-                            if phdr.p_type & elf::PT_LOAD == 0 || phdr.p_filesz == 0 {
+                            if phdr.p_filesz == 0 || (phdr.p_type != PT_LOAD && phdr.p_type != 2 /* PT_DYNAMIC */ && phdr.p_type != 7 /* PT_TLS */) {
                                 self.cur_phdr += 1;
                                 if self.cur_phdr >= phdrs.len() {
                                     return;
