@@ -1,15 +1,5 @@
 use core::slice;
-use std::{
-    arch::x86_64::__cpuid,
-    convert::TryInto,
-    fmt::Display,
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
-    mem::size_of,
-    os::unix::prelude::AsRawFd,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{arch::x86_64::__cpuid, cmp, convert::TryInto, fmt::Display, fs::{File, OpenOptions}, io::{Read, Seek, SeekFrom}, mem::size_of, os::unix::prelude::AsRawFd, path::PathBuf, sync::Arc};
 
 use kvm_bindings::{
     kvm_cpuid_entry2, kvm_memory_attributes, kvm_sev_cmd, kvm_sev_launch_measure,
@@ -677,11 +667,15 @@ impl Sev {
             // println!("before: {:?}", func);
 
             //TODO check if i goes beyond max cpuid count
+            if i == CPUID_FUNCTION_COUNT_MAX as usize {
+                break;
+            }
             page_entries[i] = func;
         }
 
+        let cpuid_count = cmp::min(CPUID_FUNCTION_COUNT_MAX as usize, cpuid.len());
         let cpuid_page = CpuidPage {
-            count: cpuid.len() as u32,
+            count: cpuid_count as u32,
             reserved: 0,
             reserved1: 0,
             functions: page_entries,
