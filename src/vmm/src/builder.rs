@@ -293,6 +293,10 @@ fn create_vmm_and_vcpus(
     )
     .map_err(StartMicrovmError::RegisterMmioDevice)?;
 
+    if let Some(sev) = sev.as_mut() {
+        sev.add_shared_region(GuestAddress(arch::MMIO_MEM_START), arch::MMIO_MEM_SIZE)
+    }
+
     let vcpus;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
