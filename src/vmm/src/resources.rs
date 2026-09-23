@@ -31,6 +31,7 @@ use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::*;
 use crate::vmm_config::pmem::{PmemBuilder, PmemConfig, PmemConfigError};
 use crate::vmm_config::serial::SerialConfig;
+use crate::vmm_config::sev_config::SevConfig;
 use crate::vmm_config::vsock::*;
 use crate::vstate::memory;
 use crate::vstate::memory::{GuestRegionMmap, MemoryError};
@@ -100,6 +101,8 @@ pub struct VmmConfig {
     #[serde(skip)]
     pub serial_config: Option<SerialConfig>,
     pub memory_hotplug: Option<MemoryHotplugConfig>,
+    #[serde(default, rename = "sev-config")]
+    pub sev_config: Option<SevConfig>,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -138,6 +141,8 @@ pub struct VmResources {
     pub serial_out_path: Option<PathBuf>,
     /// Optional rate limiter config for serial output.
     pub serial_rate_limiter_cfg: Option<TokenBucketConfig>,
+    /// SEV manager
+    pub sev: Option<SevConfig>,
 }
 
 impl VmResources {
@@ -190,6 +195,10 @@ impl VmResources {
                     resources.set_custom_cpu_template(template)
                 }
             }
+        }
+
+        if let Some(sev_config) = vmm_config.sev_config {
+            resources.sev = Some(sev_config);
         }
 
         resources.build_boot_source(vmm_config.boot_source)?;
@@ -553,6 +562,7 @@ impl From<&VmResources> for VmmConfig {
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
+            sev_config: resources.sev.clone(),
         }
     }
 }
@@ -669,6 +679,7 @@ mod tests {
             serial_out_path: None,
             serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
+            sev: None,
         }
     }
 

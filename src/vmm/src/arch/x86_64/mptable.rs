@@ -15,6 +15,7 @@ use vm_memory::GuestMemoryBackend;
 
 use crate::arch::GSI_LEGACY_END;
 use crate::arch::x86_64::generated::mpspec;
+use crate::arch::x86_64::sev::Sev;
 use crate::logger::debug;
 use crate::vstate::memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
@@ -117,6 +118,7 @@ pub fn setup_mptable(
     mem: &GuestMemoryMmap,
     resource_allocator: &mut ResourceAllocator,
     num_cpus: u8,
+    sev: &mut Option<Sev>
 ) -> Result<(), MptableError> {
     if num_cpus > MAX_SUPPORTED_CPUS {
         return Err(MptableError::TooManyCpus);
@@ -309,6 +311,12 @@ pub fn setup_mptable(
             .map_err(|_| MptableError::WriteMpcTable)?;
     }
 
+    // Try just using mp_size and base_mp
+    if let Some(sev) = sev {
+        let len = mp_size;
+        sev.add_measured_region(GuestAddress(mptable_addr), len as u64);
+    }
+
     Ok(())
 }
 
@@ -337,7 +345,7 @@ mod tests {
         let mem = single_region_mem_at(SYSTEM_MEM_START, compute_mp_size(num_cpus));
         let mut resource_allocator = ResourceAllocator::new();
 
-        setup_mptable(&mem, &mut resource_allocator, num_cpus).unwrap();
+        setup_mptable(&mem, &mut resource_allocator, num_cpus, &mut None).unwrap();
     }
 
     #[test]
@@ -346,7 +354,7 @@ mod tests {
         let mem = single_region_mem_at(SYSTEM_MEM_START, compute_mp_size(num_cpus) - 1);
         let mut resource_allocator = ResourceAllocator::new();
 
-        setup_mptable(&mem, &mut resource_allocator, num_cpus).unwrap_err();
+        setup_mptable(&mem, &mut resource_allocator, num_cpus, &mut None).unwrap_err();
     }
 
     #[test]
@@ -355,7 +363,7 @@ mod tests {
         let mem = single_region_mem_at(SYSTEM_MEM_START, compute_mp_size(num_cpus));
         let mut resource_allocator = ResourceAllocator::new();
 
-        setup_mptable(&mem, &mut resource_allocator, num_cpus).unwrap();
+        setup_mptable(&mem, &mut resource_allocator, num_cpus, &mut None).unwrap();
 
         let mpf_intel: mpspec::mpf_intel = mem.read_obj(GuestAddress(SYSTEM_MEM_START)).unwrap();
 
@@ -368,7 +376,7 @@ mod tests {
         let mem = single_region_mem_at(SYSTEM_MEM_START, compute_mp_size(num_cpus));
         let mut resource_allocator = ResourceAllocator::new();
 
-        setup_mptable(&mem, &mut resource_allocator, num_cpus).unwrap();
+        setup_mptable(&mem, &mut resource_allocator, num_cpus, &mut None).unwrap();
 
         let mpf_intel: mpspec::mpf_intel = mem.read_obj(GuestAddress(SYSTEM_MEM_START)).unwrap();
         let mpc_offset = GuestAddress(u64::from(mpf_intel.physptr));
@@ -391,7 +399,7 @@ mod tests {
         let mem = single_region_mem_at(SYSTEM_MEM_START, compute_mp_size(num_cpus));
         let mut resource_allocator = ResourceAllocator::new();
 
-        setup_mptable(&mem, &mut resource_allocator, num_cpus).unwrap();
+        setup_mptable(&mem, &mut resource_allocator, num_cpus, &mut None).unwrap();
 
         let mpf_intel: mpspec::mpf_intel = mem.read_obj(GuestAddress(SYSTEM_MEM_START)).unwrap();
         let mpc_offset = GuestAddress(u64::from(mpf_intel.physptr));
@@ -422,7 +430,7 @@ mod tests {
         for i in 0..MAX_SUPPORTED_CPUS {
             let mut resource_allocator = ResourceAllocator::new();
 
-            setup_mptable(&mem, &mut resource_allocator, i).unwrap();
+            setup_mptable(&mem, &mut resource_allocator, i, &mut None).unwrap();
 
             let mpf_intel: mpspec::mpf_intel =
                 mem.read_obj(GuestAddress(SYSTEM_MEM_START)).unwrap();
@@ -454,7 +462,7 @@ mod tests {
         let mem = single_region_mem_at(SYSTEM_MEM_START, compute_mp_size(cpus));
         let mut resource_allocator = ResourceAllocator::new();
 
-        let result = setup_mptable(&mem, &mut resource_allocator, cpus).unwrap_err();
+        let result = setup_mptable(&mem, &mut resource_allocator, cpus, &mut None).unwrap_err();
         assert_eq!(result, MptableError::TooManyCpus);
     }
 }

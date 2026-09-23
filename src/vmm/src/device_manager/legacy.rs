@@ -12,6 +12,7 @@ use acpi_tables::aml::AmlError;
 use acpi_tables::{Aml, aml};
 
 use crate::devices::legacy::{I8042Device, SerialDevice};
+use crate::devices::pseudo::fw_cfg::{FwCfg, FW_CFG_REG_ADDRESS};
 use crate::vstate::bus::BusError;
 use crate::vstate::vm::KvmVm;
 
@@ -32,6 +33,8 @@ pub struct PortIODeviceManager {
     pub stdio_serial: Arc<Mutex<SerialDevice>>,
     // BusDevice::I8042Device
     pub i8042: Arc<Mutex<I8042Device>>,
+
+    pub fw_cfg: Option<Arc<Mutex<FwCfg>>>
 }
 
 impl PortIODeviceManager {
@@ -65,6 +68,14 @@ impl PortIODeviceManager {
             Self::I8042_KDB_DATA_REGISTER_SIZE,
         )?;
 
+        if let Some(dev) = self.fw_cfg.as_ref() {
+            io_bus.insert(
+                dev.clone(),
+                FW_CFG_REG_ADDRESS,
+                0x01,
+            )?;
+        }
+
         vm.register_irq(
             self.stdio_serial
                 .lock()
@@ -82,6 +93,10 @@ impl PortIODeviceManager {
         .map_err(|e| LegacyDeviceError::EventFd(std::io::Error::from_raw_os_error(e.errno())))?;
 
         Ok(())
+    }
+
+    pub fn register_fwcfg(&mut self, fw_cfg: FwCfg) {
+        let _ = self.fw_cfg.insert(Arc::new(Mutex::new(fw_cfg)));
     }
 
     pub(crate) fn append_aml_bytes(bytes: &mut Vec<u8>) -> Result<(), AmlError> {
@@ -171,6 +186,7 @@ mod tests {
             i8042: Arc::new(Mutex::new(
                 I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap(),
             )),
+            fw_cfg: None,
         };
         ldm.register_devices(&vm).unwrap();
     }

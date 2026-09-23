@@ -9,10 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use kvm_bindings::{
-    CpuId, KVM_MAX_CPUID_ENTRIES, KVM_MAX_MSR_ENTRIES, Msrs, Xsave, kvm_debugregs, kvm_lapic_state,
-    kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, kvm_xsave2,
-};
+use kvm_bindings::{kvm_debugregs, kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, kvm_xsave2, CpuId, Msrs, Xsave, KVM_MAX_CPUID_ENTRIES, KVM_MAX_MSR_ENTRIES, KVM_SYSTEM_EVENT_SEV_TERM};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::fam::{self, FamStruct};
@@ -22,7 +19,9 @@ use crate::arch::x86_64::generated::msr_index::{MSR_IA32_TSC, MSR_IA32_TSC_DEADL
 use crate::arch::x86_64::interrupts;
 use crate::arch::x86_64::msr::{MsrError, create_boot_msr_entries};
 use crate::arch::x86_64::regs::{SetupFpuError, SetupRegistersError, SetupSpecialRegistersError};
+use crate::arch::x86_64::sev::Sev;
 use crate::cpu_config::x86_64::{CpuConfiguration, cpuid};
+use crate::initrd::InitrdConfig;
 use crate::logger::{IncMetric, METRICS, error, warn};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -294,8 +293,9 @@ impl KvmVcpu {
         &self,
         guest_mem: &GuestMemoryMmap,
         kernel_entry_point: EntryPoint,
+        initrd: &Option<InitrdConfig>
     ) -> Result<(), KvmVcpuConfigureError> {
-        crate::arch::x86_64::regs::setup_regs(&self.fd, kernel_entry_point)?;
+        crate::arch::x86_64::regs::setup_regs(&self.fd, kernel_entry_point, initrd)?;
         crate::arch::x86_64::regs::setup_fpu(&self.fd)?;
         crate::arch::x86_64::regs::setup_sregs(guest_mem, &self.fd, kernel_entry_point.protocol)?;
         crate::arch::x86_64::interrupts::set_lint(&self.fd)?;
@@ -777,6 +777,77 @@ impl Peripherals {
                 }
                 Ok(VcpuEmulation::Handled)
             }
+            /* VcpuExit::MemoryFault(flags, gpa, size) => {
+                info!("memory fault: flags=0x{:x}, gpa=0x{:x}, size=0x{:x}", flags, gpa, size);
+                Sev::set_page_state(vm_fd, gpa >> 12, size, flags == 8);
+                Ok(VcpuEmulation::Handled)
+            } */
+            VcpuExit::SystemEvent(event_type, data) => {
+                /// The SEV guest requested termination via the GHCB
+                /// MSR protocol.
+                if event_type == KVM_SYSTEM_EVENT_SEV_TERM {
+                    // data[0] holds the GHCB MSR value of the request:
+                    // bits [11:0]  GHCBInfo (0x100 = termination request)
+                    // bits [15:12] reason code set
+                    // bits [23:16] reason code
+                    let ghcb_msr = data.first().copied().unwrap_or(0);
+                    let reason_set = (ghcb_msr >> 12) & 0xf;
+                    let reason_code = (ghcb_msr >> 16) & 0xff;
+                    error!(
+								"Guest requested termination: reason code set {reason_set:#x}, reason code {reason_code:#x}"
+							);
+                    return Ok(VcpuEmulation::Stopped);
+                }
+
+                Err(VcpuError::UnhandledKvmExit(format!(
+                    "unhandled system event: type {event_type}, data {data:?}"
+                )))
+            }
+            VcpuExit::Hypercall(hypercall_exit) => {
+                const KVM_HC_MAP_GPA_RANGE: u64 = 12;
+                const KVM_MAP_GPA_RANGE_ENCRYPTED: u64 = 1 << 4;
+
+                match hypercall_exit.nr {
+                    /* KVM_HC_MAP_GPA_RANGE => {
+                        let [gpa, npages, attrs, ..] = hypercall_exit.args;
+                        let private = attrs & KVM_MAP_GPA_RANGE_ENCRYPTED != 0;
+
+                        Sev::set_page_state(vm_fd, gfn, page_size, op == 1);
+
+                        /*
+                        let op = (ghcb_msr >> 52) & mask;
+
+                    let mut gfn = (ghcb_msr >> 12) & 0xffffffffff;
+
+                    let mut page_size = 0x1000;
+
+                    if ghcb_msr >> 63 != 0 {
+                        page_size = 0x200000;
+                        gfn = (gfn << 12) >> 21;
+                    }
+
+                    Sev::set_page_state(vm_fd, gfn, page_size, op == 1);
+                    return Ok(VcpuEmulation::Handled);
+                         */
+
+                        Sev::set_memory_attributes(
+                            vm_fd,
+                            gpa,
+                            npages * 0x1000u64,
+                            private,
+                        )
+                            .map_err(io::Error::from)?;
+                        *hypercall_exit.ret = 0;
+                    } */
+                    nr => {
+                        warn!("unhandled KVM hypercall {nr}");
+                        // -KVM_ENOSYS
+                        *hypercall_exit.ret = (-1000_i64) as u64;
+                    }
+                };
+
+                Ok(VcpuEmulation::Handled)
+            },
             unexpected_exit => {
                 METRICS.vcpu.failures.inc();
                 error!("Unexpected exit reason on vcpu run: {:?}", unexpected_exit);
@@ -897,7 +968,7 @@ mod tests {
         let msrs = vcpu.get_msrs(template.msr_index_iter())?;
         let msrs = apply_template_to_msrs(msrs, template)?;
         vcpu.configure_msrs_for_boot(&msrs, &configured_cpuid)?;
-        vcpu.configure_boot_state(vm.guest_memory(), entry_point)?;
+        vcpu.configure_boot_state(vm.guest_memory(), entry_point, None)?;
 
         Ok(())
     }

@@ -11,7 +11,7 @@ use std::mem;
 use kvm_bindings::{kvm_fpu, kvm_regs, kvm_sregs};
 use kvm_ioctls::VcpuFd;
 use vm_memory::GuestMemoryBackend;
-
+use crate::initrd::InitrdConfig;
 use super::super::{BootProtocol, EntryPoint};
 use super::gdt::{gdt_entry, kvm_segment_from_gdt};
 use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
@@ -83,7 +83,7 @@ pub struct SetupRegistersError(vmm_sys_util::errno::Error);
 /// # Errors
 ///
 /// When [`kvm_ioctls::ioctls::vcpu::VcpuFd::set_regs`] errors.
-pub fn setup_regs(vcpu: &VcpuFd, entry_point: EntryPoint) -> Result<(), SetupRegistersError> {
+pub fn setup_regs(vcpu: &VcpuFd, entry_point: EntryPoint, initrd: &Option<InitrdConfig>) -> Result<(), SetupRegistersError> {
     let regs: kvm_regs = match entry_point.protocol {
         BootProtocol::PvhBoot => kvm_regs {
             // Configure regs as required by PVH boot protocol.
@@ -106,6 +106,30 @@ pub fn setup_regs(vcpu: &VcpuFd, entry_point: EntryPoint) -> Result<(), SetupReg
             // Must point to zero page address per Linux ABI. This is x86_64 specific.
             rsi: super::layout::ZERO_PAGE_START,
             ..Default::default()
+        },
+        BootProtocol::SEVBoot => {
+            kvm_regs {
+                // Configure regs as required by Linux 64-bit boot protocol.
+                rflags: 0x0000_0000_0000_0002u64,
+                rip: entry_point.entry_addr.raw_value(),
+                // Frame pointer. It gets a snapshot of the stack pointer (rsp) so that when adjustments
+                // are made to rsp (i.e. reserving space for local variables or pushing
+                // values on to the stack), local variables and function parameters are
+                // still accessible from a constant offset from rbp.
+                rsp: super::layout::BOOT_STACK_POINTER,
+                // Starting stack pointer.
+                rbp: super::layout::BOOT_STACK_POINTER,
+                // Must point to zero page address per Linux ABI. This is x86_64 specific.
+                rsi: super::layout::ZERO_PAGE_START,
+
+                rbx: super::layout::PVH_INFO_START,
+
+                // Custom registers for initrd... (TODO: remove and make this standard from BootInfo)
+                r14: initrd.as_ref().map(|rd| rd.size as u64).unwrap_or_default(),
+                r15: initrd.as_ref().map(|rd| rd.address.0).unwrap_or_default(),
+
+                ..Default::default()
+            }
         },
     };
 
@@ -199,7 +223,7 @@ fn configure_segments_and_sregs(
     boot_prot: BootProtocol,
 ) -> Result<(), RegsError> {
     let gdt_table: [u64; BOOT_GDT_MAX] = match boot_prot {
-        BootProtocol::PvhBoot => {
+        BootProtocol::PvhBoot | BootProtocol::SEVBoot => {
             // Configure GDT entries as specified by PVH boot protocol
             [
                 gdt_entry(0, 0, 0),                // NULL
@@ -241,7 +265,7 @@ fn configure_segments_and_sregs(
     sregs.tr = tss_seg;
 
     match boot_prot {
-        BootProtocol::PvhBoot => {
+        BootProtocol::PvhBoot | BootProtocol::SEVBoot => {
             sregs.cr0 = X86_CR0_PE | X86_CR0_ET;
             sregs.cr4 = 0;
         }
@@ -391,7 +415,7 @@ mod tests {
             setup_header: None,
         };
 
-        setup_regs(&vcpu, entry_point).unwrap();
+        setup_regs(&vcpu, entry_point, &None).unwrap();
 
         let actual_regs: kvm_regs = vcpu.get_regs().unwrap();
         assert_eq!(actual_regs, expected_regs);

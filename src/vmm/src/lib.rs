@@ -117,6 +117,7 @@ pub mod vstate;
 pub mod initrd;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -129,8 +130,9 @@ use vm_memory::GuestMemoryBackend;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::terminal::Terminal;
 use vstate::vcpu::{self, VcpuSendEventError};
-
+use crate::arch::x86_64::sev::Sev;
 use crate::cpu_config::templates::CpuConfiguration;
+use crate::devices::pseudo::fw_cfg::KernelType;
 use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
 use crate::devices::virtio::balloon::{
     BALLOON_DEV_ID, Balloon, BalloonConfig, BalloonError, BalloonStats,
@@ -144,6 +146,7 @@ use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+use crate::initrd::InitrdConfig;
 use crate::logger::{METRICS, MetricsError, log_dev_preview_warning};
 use crate::mmds::data_store::Mmds;
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
@@ -159,6 +162,7 @@ use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
+use crate::vmm_config::sev_config::SevConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
@@ -271,6 +275,9 @@ pub enum VmmError {
     NotSupported,
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
+    /// Error setting up SEV
+    #[cfg(target_arch = "x86_64")]
+    Sev(#[from] arch::x86_64::sev::SevError),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -308,6 +315,9 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
+
+    #[cfg(all(target_arch = "x86_64"))]
+    sev: Option<Sev>,
 }
 
 impl Vmm {
@@ -411,6 +421,8 @@ impl Vmm {
             }
         });
 
+        let sev_config = self.sev.as_ref().map(|sev| sev.original_config.clone());
+
         // This must match the From<&VmResources> for VmmConfig implementation
         // in resources.rs which is used to retrieve the config before the VM
         // is started.
@@ -430,6 +442,7 @@ impl Vmm {
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
             memory_hotplug,
+            sev_config
         }
     }
 
@@ -609,6 +622,55 @@ impl Vmm {
             .with_virtio_device(net_id, |net: &mut Net| {
                 net.patch_rate_limiters(rx_bytes, rx_ops, tx_bytes, tx_ops)
             })?;
+        Ok(())
+    }
+
+
+    /// Initializes SEV
+    pub fn setup_sev(
+        &mut self,
+        fw_path: &String,
+        mut kernel_file: File,
+        kernel_type: KernelType,
+        initrd: &Option<InitrdConfig>,
+    ) -> Result<u64, VmmError> {
+        let Some(kvm) = self.vm.as_kvm() else {
+            return Ok(0u64);
+        };
+
+        if let Some(sev) = self.sev.as_mut() {
+            sev.load_firmware(fw_path, kvm.guest_memory())
+                .map_err(|err| VmmError::Sev(err))?;
+
+            sev.snp_insert_cpuid_page(kvm.guest_memory(), kvm.common.kvm.supported_cpuid.as_slice())
+                .map_err(|err| VmmError::Sev(err))?;
+
+            sev.snp_insert_secrets_page(kvm.guest_memory())
+                .map_err(|err| VmmError::Sev(err))?;
+
+            return Ok(sev
+                .load_kernel_and_initrd(
+                    &mut kernel_file,
+                    kernel_type == KernelType::BzImage,
+                    kvm.guest_memory(),
+                    initrd,
+                )
+                .map_err(|err| VmmError::Sev(err))?);
+        }
+        Ok(0u64)
+    }
+
+    /// Finishes SEV boot
+    pub fn finish_sev(&mut self) -> Result<(), VmmError> {
+        let Some(kvm) = self.vm.as_kvm() else {
+            return Ok(());
+        };
+
+        if let Some(sev) = self.sev.as_mut() {
+            sev.measure_regions(kvm.guest_memory())?;
+
+            sev.snp_launch_finish()?;
+        }
         Ok(())
     }
 

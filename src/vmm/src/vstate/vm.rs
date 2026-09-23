@@ -14,10 +14,7 @@ use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
-use kvm_bindings::{
-    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID, KvmIrqRouting,
-    kvm_irq_routing_entry, kvm_userspace_memory_region,
-};
+use kvm_bindings::{kvm_irq_routing_entry, kvm_userspace_memory_region, KvmIrqRouting, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID, KVM_X86_SNP_VM, KVM_X86_DEFAULT_VM, kvm_create_guest_memfd, kvm_userspace_memory_region2, KVM_MEM_GUEST_MEMFD};
 use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
 use userfaultfd::Uffd;
@@ -87,6 +84,7 @@ pub struct VmCommon {
     /// to exercise partial-failure handling. 0 means never fail.
     #[cfg(test)]
     fail_set_user_memory_region_in: AtomicU32,
+    snp: bool
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -144,7 +142,7 @@ impl Vm {
 /// Contains KvmVm functions that are usable across CPU architectures
 impl KvmVm {
     /// Create a KVM VM
-    pub fn create_common(kvm: Kvm) -> Result<VmCommon, VmError> {
+    pub fn create_common(kvm: Kvm, snp: bool) -> Result<VmCommon, VmError> {
         // It is known that KVM_CREATE_VM occasionally fails with EINTR on heavily loaded machines
         // with many VMs.
         //
@@ -168,7 +166,13 @@ impl KvmVm {
         const MAX_ATTEMPTS: u32 = 5;
         let mut attempt = 1;
         let fd = loop {
-            match kvm.fd.create_vm() {
+            let vm_type = if snp {
+                KVM_X86_SNP_VM
+            } else {
+                KVM_X86_DEFAULT_VM
+            };
+
+            match kvm.fd.create_vm_with_type(vm_type.into()) {
                 Ok(fd) => break fd,
                 Err(e) if e.errno() == libc::EINTR && attempt < MAX_ATTEMPTS => {
                     info!("Attempt #{attempt} of KVM_CREATE_VM returned EINTR");
@@ -197,6 +201,7 @@ impl KvmVm {
             vcpus_exit_evt,
             #[cfg(test)]
             fail_set_user_memory_region_in: AtomicU32::new(0),
+            snp
         })
     }
 
@@ -438,11 +443,46 @@ impl KvmVm {
                 libc::ENOMEM,
             )));
         }
-        // SAFETY: Safe because the fd is a valid KVM file descriptor.
-        unsafe {
-            self.fd()
-                .set_user_memory_region(region)
-                .map_err(VmError::SetUserMemoryRegion)
+
+        if self.common.snp {
+            let gmem = kvm_create_guest_memfd {
+                size: region.memory_size,
+                flags: 0,
+                reserved: [0; 6],
+            };
+
+            let memfd = unsafe {
+                self.fd().create_guest_memfd(gmem)
+                    .map_err(VmError::SetUserMemoryRegion)
+            }?;
+
+            let mem_region = kvm_userspace_memory_region2 {
+                slot: region.slot,
+                guest_phys_addr: region.guest_phys_addr,
+                memory_size: region.memory_size,
+                userspace_addr: region.userspace_addr,
+                flags: region.flags | KVM_MEM_GUEST_MEMFD,
+
+                guest_memfd_offset: 0,
+                guest_memfd: memfd as u32,
+
+                ..Default::default()
+            };
+
+            // SAFETY: Safe because the fd is a valid KVM file descriptor.
+            unsafe {
+                self.fd()
+                    .set_user_memory_region2(mem_region)
+                    .map_err(VmError::SetUserMemoryRegion)
+            }
+        } else {
+
+            // SAFETY: Safe because the fd is a valid KVM file descriptor.
+            unsafe {
+                self.fd()
+                    .set_user_memory_region(region)
+                    .map_err(VmError::SetUserMemoryRegion)
+            }
         }
     }
 
@@ -820,7 +860,7 @@ pub(crate) mod tests {
     // Auxiliary function being used throughout the tests.
     pub(crate) fn setup_vm() -> KvmVm {
         let kvm = Kvm::new(vec![]).expect("Cannot create Kvm");
-        KvmVm::new(kvm).expect("Cannot create new vm")
+        KvmVm::new(kvm, false).expect("Cannot create new vm")
     }
 
     // Auxiliary function being used throughout the tests.
@@ -835,7 +875,7 @@ pub(crate) mod tests {
     fn test_new() {
         // Testing with a valid /dev/kvm descriptor.
         let kvm = Kvm::new(vec![]).expect("Cannot create Kvm");
-        KvmVm::new(kvm).unwrap();
+        KvmVm::new(kvm, false).unwrap();
     }
 
     #[test]

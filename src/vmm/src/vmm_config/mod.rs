@@ -36,6 +36,8 @@ pub mod serial;
 pub mod snapshot;
 /// Wrapper for configuring the vsock devices attached to the microVM.
 pub mod vsock;
+/// Wrapper for configuring SEV
+pub mod sev_config;
 
 #[allow(missing_docs)]
 #[derive(Debug)]

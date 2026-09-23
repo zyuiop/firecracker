@@ -927,7 +927,7 @@ pub(crate) mod tests {
                 .configure_msrs_for_boot(&BTreeMap::new(), &configured_cpuid)
                 .expect("failed to configure vcpu MSRs");
             vcpu.kvm_vcpu
-                .configure_boot_state(vm.guest_memory(), entry_point)
+                .configure_boot_state(vm.guest_memory(), entry_point, &None)
                 .expect("failed to configure vcpu");
         }
 

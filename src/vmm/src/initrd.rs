@@ -40,23 +40,33 @@ impl InitrdConfig {
     pub fn from_config(
         boot_cfg: &BootConfig,
         vm_memory: &GuestMemoryMmap,
+        sev: bool,
     ) -> Result<Option<Self>, InitrdError> {
         Ok(match &boot_cfg.initrd_file {
             Some(f) => {
                 let f = f.try_clone().map_err(InitrdError::CloneFd)?;
-                Some(Self::from_file(vm_memory, f)?)
+                Some(Self::from_file(vm_memory, f, sev)?)
             }
             None => None,
         })
     }
 
     /// Loads the initrd from a file into guest memory.
-    pub fn from_file(vm_memory: &GuestMemoryMmap, mut file: File) -> Result<Self, InitrdError> {
+    pub fn from_file(vm_memory: &GuestMemoryMmap, mut file: File, sev: bool) -> Result<Self, InitrdError> {
         let size = file.metadata().map_err(InitrdError::Metadata)?.size();
         let size = u64_to_usize(size);
         let Some(address) = initrd_load_addr(vm_memory, size) else {
             return Err(InitrdError::Address);
         };
+
+        let address = if !sev {
+            address
+        } else {
+            let align_to_pagesize = |address| address & !(0x200000 - 1);
+            let load_addr_aligned = align_to_pagesize(address);
+            align_to_pagesize(load_addr_aligned - size as u64)
+        };
+
         let mut slice = vm_memory
             .get_slice(GuestAddress(address), size)
             .map_err(|_| InitrdError::Load)?;
@@ -105,7 +115,7 @@ mod tests {
 
         // Need to reset the cursor to read initrd properly.
         tempfile.seek(SeekFrom::Start(0)).unwrap();
-        let initrd = InitrdConfig::from_file(&gm, tempfile).unwrap();
+        let initrd = InitrdConfig::from_file(&gm, tempfile, false).unwrap();
         assert!(gm.address_in_range(initrd.address));
         assert_eq!(initrd.size, image.len());
     }
@@ -120,7 +130,7 @@ mod tests {
 
         // Need to reset the cursor to read initrd properly.
         tempfile.seek(SeekFrom::Start(0)).unwrap();
-        let res = InitrdConfig::from_file(&gm, tempfile);
+        let res = InitrdConfig::from_file(&gm, tempfile, false);
         assert!(matches!(res, Err(InitrdError::Address)), "{:?}", res);
     }
 
@@ -134,7 +144,7 @@ mod tests {
 
         // Need to reset the cursor to read initrd properly.
         tempfile.seek(SeekFrom::Start(0)).unwrap();
-        let res = InitrdConfig::from_file(&gm, tempfile);
+        let res = InitrdConfig::from_file(&gm, tempfile, false);
         assert!(matches!(res, Err(InitrdError::Address)), "{:?}", res);
     }
 }

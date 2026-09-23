@@ -18,7 +18,7 @@ use vm_memory::GuestAddress;
 
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
-use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
+use crate::arch::{configure_system_for_boot, load_kernel, ConfigurationError, MMIO64_MEM_START, MMIO32_MEM_SIZE, MMIO64_MEM_SIZE};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
 use crate::cpu_config::templates::{GetCpuTemplate, GetCpuTemplateError, GuestConfigError};
@@ -47,9 +47,7 @@ use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::utils::{u32_mib_to_bytes, u64_to_usize};
-use crate::vmm_config::boot_source::{
-    DEFAULT_KERNEL_CMDLINE, append_root_device_cmdline, build_cmdline,
-};
+use crate::vmm_config::boot_source::{append_root_device_cmdline, build_cmdline, BootConfig, DEFAULT_KERNEL_CMDLINE};
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -60,7 +58,10 @@ use crate::vstate::memory::GuestRegionMmap;
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
 use crate::vstate::vm::{KvmVm, Vm, VmError};
-use crate::{EventManager, Vmm, VmmError};
+use crate::{devices, EventManager, Vmm, VmmError};
+use crate::arch::x86_64::sev::Sev;
+use crate::devices::pseudo::fw_cfg;
+use crate::devices::pseudo::fw_cfg::KernelType;
 
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -175,7 +176,7 @@ pub fn build_microvm_for_boot(
     let kvm = Kvm::new(cpu_template.kvm_capabilities.clone())?;
     // Set up KVM VM and register memory regions.
     // Build custom CPU config if a custom template is provided.
-    let mut vm = KvmVm::new(kvm)?;
+    let mut vm = KvmVm::new(kvm, vm_resources.sev.is_some())?;
     let mut vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
     vm.register_dram_memory_regions(guest_memory)?;
 
@@ -201,6 +202,14 @@ pub fn build_microvm_for_boot(
     let kvm_vm = Arc::new(vm);
     let vm = Vm::Kvm(kvm_vm.clone());
 
+    let mut sev = vm_resources.sev.as_ref().map(|sev| {
+        let mut sev_dev = Sev::new(Arc::clone(&kvm_vm), sev.clone(), request_ts.clone());
+        sev_dev.snp_init().unwrap();
+        sev_dev.add_shared_region(GuestAddress(MMIO64_MEM_START), MMIO64_MEM_SIZE);
+
+        sev_dev
+    });
+
     let mut device_manager = DeviceManager::new(
         event_manager,
         kvm_vm.vcpus_exit_evt(),
@@ -212,10 +221,21 @@ pub fn build_microvm_for_boot(
 
     let guest_memory = kvm_vm.guest_memory();
     let entry_point = load_kernel(&boot_config.kernel_file, guest_memory)?;
-    let initrd = InitrdConfig::from_config(boot_config, guest_memory)?;
+    let initrd = InitrdConfig::from_config(boot_config, guest_memory, sev.is_some())?;
 
     if !vm_resources.pci_enabled {
         boot_cmdline.insert("pci", "off")?;
+    }
+
+    if let Some(sev) = sev.as_mut() {
+        let kernel_type = attach_fw_cfg_device(
+            &mut device_manager,
+            Arc::clone(&kvm_vm),
+            sev,
+            boot_config,
+            &vm_resources.sev.as_ref().unwrap().kernel_hash_path,
+            &vm_resources.sev.as_ref().unwrap().initrd_hash_path,
+        )?;
     }
 
     // The boot timer device needs to be the first device attached in order
@@ -318,16 +338,24 @@ pub fn build_microvm_for_boot(
         entry_point,
         &initrd,
         boot_cmdline,
+        &mut sev
     )?;
 
-    let vmm = Vmm {
+    let mut vmm = Vmm {
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
         shutdown_exit_code: None,
         vm,
         device_manager,
+        sev
     };
+
+    #[cfg(target_arch = "x86_64")]
+    if vmm.sev.is_some() {
+        vmm.finish_sev().unwrap();
+    }
+
     let vmm = Arc::new(Mutex::new(vmm));
 
     #[cfg(feature = "gdb")]
@@ -441,7 +469,7 @@ pub fn build_microvm_from_snapshot(
         .map_err(StartMicrovmError::Kvm)?;
     // Set up KVM VM and register memory regions.
     // Build custom CPU config if a custom template is provided.
-    let mut vm = KvmVm::new(kvm).map_err(StartMicrovmError::KvmVm)?;
+    let mut vm = KvmVm::new(kvm, vm_resources.sev.is_some()).map_err(StartMicrovmError::KvmVm)?;
 
     let mut vcpus = vm
         .create_vcpus(vm_resources.machine_config.vcpu_count)
@@ -517,6 +545,7 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        sev: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -767,6 +796,31 @@ fn attach_balloon_device(
     device_manager.attach_boot_virtio_device(vm, id, balloon.clone(), cmdline, event_manager, false)
 }
 
+pub(crate) fn attach_fw_cfg_device(
+    device_manager: &mut DeviceManager,
+    vm: Arc<KvmVm>,
+    sev: &mut Sev,
+    boot_config: &BootConfig,
+    kernel_hashes_path: &String,
+    initrd_hashes_path: &Option<String>,
+) -> std::result::Result<KernelType, StartMicrovmError> {
+    let fw_cfg = fw_cfg::FwCfg::new(
+        boot_config.kernel_file.try_clone().unwrap(),
+        kernel_hashes_path,
+        initrd_hashes_path,
+        vm,
+        Some(sev),
+    );
+
+    let kernel_type = fw_cfg.kernel_type();
+
+    device_manager.legacy_devices.as_mut()
+        .expect("missing legacy devices")
+        .register_fwcfg(fw_cfg);
+
+    Ok(kernel_type)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
 
@@ -872,6 +926,7 @@ pub(crate) mod tests {
             boot_source_config: BootSourceConfig::default(),
             shutdown_exit_code: None,
             vm: Vm::Kvm(vm),
+            sev: None,
             device_manager,
         }
     }

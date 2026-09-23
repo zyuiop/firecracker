@@ -31,6 +31,8 @@ pub mod xstate;
 #[allow(missing_docs)]
 pub mod generated;
 
+pub mod sev;
+
 use std::cmp::max;
 use std::fs::File;
 
@@ -69,6 +71,7 @@ use linux_loader::loader::{
     Cmdline, Error as KernelLoaderError, KernelLoader, PvhBootCapability, load_cmdline,
 };
 use vm_memory::GuestMemoryBackend;
+use crate::arch::x86_64::sev::{Sev, CPUID_PAGE_ADDR, CPUID_PAGE_LEN, SECRETS_PAGE_ADDR, SECRETS_PAGE_LEN};
 
 // Value taken from https://elixir.bootlin.com/linux/v5.10.68/source/arch/x86/include/uapi/asm/e820.h#L31
 // Usable normal RAM
@@ -201,6 +204,7 @@ fn configure_vcpus_for_boot(
     cpu_template: &CustomCpuTemplate,
     guest_mem: &GuestMemoryMmap,
     entry_point: EntryPoint,
+    initrd: &Option<InitrdConfig>
 ) -> Result<(), ConfigurationError> {
     // Phase 1: construct the shared, templated guest CPUID.
     let cpuid = Cpuid::try_from(kvm.supported_cpuid.clone()).map_err(GuestConfigError::from)?;
@@ -226,7 +230,7 @@ fn configure_vcpus_for_boot(
     for (vcpu, configured_cpuid) in vcpus.iter_mut().zip(&configured_cpuids) {
         vcpu.kvm_vcpu
             .configure_msrs_for_boot(&msrs, configured_cpuid)?;
-        vcpu.kvm_vcpu.configure_boot_state(guest_mem, entry_point)?;
+        vcpu.kvm_vcpu.configure_boot_state(guest_mem, entry_point, initrd)?;
     }
 
     Ok(())
@@ -244,6 +248,7 @@ pub fn configure_system_for_boot(
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
+    sev: &mut Option<Sev>
 ) -> Result<(), ConfigurationError> {
     configure_vcpus_for_boot(
         kvm,
@@ -252,6 +257,7 @@ pub fn configure_system_for_boot(
         cpu_template,
         vm.guest_memory(),
         entry_point,
+        initrd
     )?;
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
@@ -268,11 +274,20 @@ pub fn configure_system_for_boot(
     )
     .map_err(ConfigurationError::LoadCommandline)?;
 
+    #[cfg(target_arch = "x86_64")]
+    if let Some(sev) = sev.as_mut() {
+        sev.add_measured_region(
+            GuestAddress(crate::arch::x86_64::layout::CMDLINE_START),
+            boot_cmdline.as_cstring().unwrap().as_bytes().len() as u64,
+        );
+    }
+
     // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
     mptable::setup_mptable(
         vm.guest_memory(),
         &mut vm.resource_allocator(),
         machine_config.vcpu_count,
+        sev
     )
     .map_err(ConfigurationError::MpTableSetup)?;
 
@@ -280,13 +295,18 @@ pub fn configure_system_for_boot(
         BootProtocol::PvhBoot => {
             configure_pvh(vm.guest_memory(), GuestAddress(CMDLINE_START), initrd)?;
         }
-        BootProtocol::LinuxBoot => {
+        BootProtocol::LinuxBoot | BootProtocol::SEVBoot => {
+            if entry_point.protocol == BootProtocol::SEVBoot && sev.is_none() {
+                panic!("invalid state: SEV boot protocol but no SEV configuration")
+            }
+
             configure_64bit_boot(
                 vm.guest_memory(),
                 GuestAddress(CMDLINE_START),
                 cmdline_size,
                 initrd,
                 entry_point.setup_header,
+                sev
             )?;
         }
     }
@@ -400,6 +420,7 @@ fn configure_64bit_boot(
     cmdline_size: usize,
     initrd: &Option<InitrdConfig>,
     setup_header: Option<setup_header>,
+    sev: &mut Option<Sev>
 ) -> Result<(), ConfigurationError> {
     const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
     const KERNEL_HDR_MAGIC: u32 = 0x5372_6448;
@@ -448,6 +469,21 @@ fn configure_64bit_boot(
         E820_RESERVED,
     )?;
 
+    if sev.is_some() {
+        add_e820_entry(
+            &mut params,
+            SECRETS_PAGE_ADDR.0,
+            SECRETS_PAGE_LEN.into(),
+            E820_RESERVED,
+        )?;
+        add_e820_entry(
+            &mut params,
+            CPUID_PAGE_ADDR.0,
+            CPUID_PAGE_LEN.into(),
+            E820_RESERVED,
+        )?;
+    }
+
     for region in guest_mem
         .iter()
         .filter(|region| region.region_type == GuestRegionType::Dram)
@@ -460,6 +496,14 @@ fn configure_64bit_boot(
             region.last_addr().unchecked_offset_from(addr) + 1,
             E820_RAM,
         )?;
+    }
+
+    let boot_params = BootParams::new(&params, GuestAddress(layout::ZERO_PAGE_START));
+
+    if let Some(sev) = sev {
+        let len = boot_params.header.len();
+        sev.add_ram_regions(&params.e820_table, params.e820_entries.into());
+        sev.add_measured_region(boot_params.header_start, len as u64);
     }
 
     LinuxBootConfigurator::write_bootparams(
@@ -674,7 +718,7 @@ mod tests {
         let no_vcpus = 4;
         let gm = single_region_mem(0x10000);
         let mut resource_allocator = ResourceAllocator::new();
-        let err = mptable::setup_mptable(&gm, &mut resource_allocator, 1);
+        let err = mptable::setup_mptable(&gm, &mut resource_allocator, 1, &mut None);
         assert!(matches!(
             err.unwrap_err(),
             mptable::MptableError::NotEnoughMemory
@@ -684,24 +728,24 @@ mod tests {
         let mem_size = mib_to_bytes(128);
         let gm = arch_mem(mem_size);
         let mut resource_allocator = ResourceAllocator::new();
-        mptable::setup_mptable(&gm, &mut resource_allocator, no_vcpus).unwrap();
-        configure_64bit_boot(&gm, GuestAddress(0), 0, &None, None).unwrap();
+        mptable::setup_mptable(&gm, &mut resource_allocator, no_vcpus, &mut None).unwrap();
+        configure_64bit_boot(&gm, GuestAddress(0), 0, &None, None, &mut None).unwrap();
         configure_pvh(&gm, GuestAddress(0), &None).unwrap();
 
         // Now assigning some memory that is equal to the start of the 32bit memory hole.
         let mem_size = mib_to_bytes(3328);
         let gm = arch_mem(mem_size);
         let mut resource_allocator = ResourceAllocator::new();
-        mptable::setup_mptable(&gm, &mut resource_allocator, no_vcpus).unwrap();
-        configure_64bit_boot(&gm, GuestAddress(0), 0, &None, None).unwrap();
+        mptable::setup_mptable(&gm, &mut resource_allocator, no_vcpus, &mut None).unwrap();
+        configure_64bit_boot(&gm, GuestAddress(0), 0, &None, None, &mut None).unwrap();
         configure_pvh(&gm, GuestAddress(0), &None).unwrap();
 
         // Now assigning some memory that falls after the 32bit memory hole.
         let mem_size = mib_to_bytes(3330);
         let gm = arch_mem(mem_size);
         let mut resource_allocator = ResourceAllocator::new();
-        mptable::setup_mptable(&gm, &mut resource_allocator, no_vcpus).unwrap();
-        configure_64bit_boot(&gm, GuestAddress(0), 0, &None, None).unwrap();
+        mptable::setup_mptable(&gm, &mut resource_allocator, no_vcpus, &mut None).unwrap();
+        configure_64bit_boot(&gm, GuestAddress(0), 0, &None, None, &mut None).unwrap();
         configure_pvh(&gm, GuestAddress(0), &None).unwrap();
     }
 

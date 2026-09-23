@@ -129,6 +129,11 @@ impl fmt::Display for DeviceType {
 pub enum BootProtocol {
     /// Linux 64-bit boot protocol
     LinuxBoot,
+
+    #[cfg(all(target_arch = "x86_64"))]
+    /// SEV boot (loads a firmware, and the firmware takes care about booting the kernel)
+    SEVBoot,
+
     #[cfg(target_arch = "x86_64")]
     /// PVH boot protocol (x86/HVM direct boot ABI)
     PvhBoot,
@@ -140,6 +145,8 @@ impl fmt::Display for BootProtocol {
             BootProtocol::LinuxBoot => write!(f, "Linux 64-bit boot protocol"),
             #[cfg(target_arch = "x86_64")]
             BootProtocol::PvhBoot => write!(f, "PVH boot protocol"),
+            #[cfg(target_arch = "x86_64")]
+            BootProtocol::SEVBoot => write!(f, "Linux 64-bit boot protocol with SNP firmware")
         }
     }
 }
