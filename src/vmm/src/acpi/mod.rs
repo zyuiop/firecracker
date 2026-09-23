@@ -166,7 +166,7 @@ impl AcpiTableWriter<'_> {
     /// This will build the RSDP pointer which points to the XSDT table and write it in guest
     /// memory. The address in which we write RSDP is pre-determined for every architecture.
     /// We will not allocate arbitrary memory for it
-    fn build_rsdp(&mut self, xsdt_addr: u64) -> Result<(), AcpiError> {
+    fn build_rsdp(&mut self, xsdt_addr: u64) -> Result<GuestAddress, AcpiError> {
         let mut rsdp = Rsdp::new(OEM_ID, xsdt_addr);
         rsdp.write_to_guest(self.mem, rsdp_addr())
             .inspect_err(|err| error!("acpi: Could not write RSDP in guest memory: {err}"))?;
@@ -176,7 +176,7 @@ impl AcpiTableWriter<'_> {
             rsdp.len(),
             rsdp_addr().0
         );
-        Ok(())
+        Ok(rsdp_addr())
     }
 }
 
@@ -189,7 +189,7 @@ pub(crate) fn create_acpi_tables(
     device_manager: &mut DeviceManager,
     resource_allocator: &mut ResourceAllocator,
     vcpus: &[Vcpu],
-) -> Result<(), AcpiError> {
+) -> Result<GuestAddress, AcpiError> {
     let mut writer = AcpiTableWriter { mem };
     let dsdt_addr = writer.build_dsdt(device_manager, resource_allocator)?;
 

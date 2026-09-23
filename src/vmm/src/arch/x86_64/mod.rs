@@ -313,12 +313,17 @@ pub fn configure_system_for_boot(
 
     // Create ACPI tables and write them in guest memory
     // For the time being we only support ACPI in x86_64
-    create_acpi_tables(
+    let addr = create_acpi_tables(
         vm.guest_memory(),
         device_manager,
         &mut vm.resource_allocator(),
         vcpus,
     )?;
+
+    if let Some(sev) = sev {
+        sev.add_shared_region(addr, 0x1000);
+    }
+
     Ok(())
 }
 

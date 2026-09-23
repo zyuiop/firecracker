@@ -64,8 +64,8 @@ pub const IOAPIC_ADDR: u32 = 0xfec0_0000;
 pub const RSDP_ADDR: u64 = 0x000e_0000;
 
 /// Start of memory region we will use for system data (MPTable, ACPI, etc). We are putting its
-/// start address where EBDA normally starts, i.e. in the last 1 KiB of the first 640KiB of memory
-pub const SYSTEM_MEM_START: u64 = 0x9fc00;
+/// start address where EBDA normally starts, i.e. in the last 4 KiB of the first 640KiB of memory
+pub const SYSTEM_MEM_START: u64 = 0x9_f000;
 
 /// Size of memory region for system data.
 ///
