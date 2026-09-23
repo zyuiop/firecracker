@@ -223,8 +223,9 @@ impl DeviceManager {
         // create pio dev manager with legacy devices
         let mut legacy_devices = PortIODeviceManager {
             stdio_serial: serial,
-            fw_cfg: None,
             i8042,
+            debug_port: None,
+            fw_cfg: None
         };
         legacy_devices.register_devices(vm)?;
         Ok(legacy_devices)

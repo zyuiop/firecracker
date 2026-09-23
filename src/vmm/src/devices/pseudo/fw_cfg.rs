@@ -7,7 +7,7 @@ use std::{
 };
 use std::mem::size_of;
 use std::os::unix::fs::MetadataExt;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use goblin::elf64;
 use linux_loader::{bootparam::setup_header, elf as elf_magic};
 use goblin::elf::Elf;
@@ -20,7 +20,7 @@ use scroll::ctx::TryIntoCtx;
 use scroll::Endian;
 use vm_memory::{ByteValued, Bytes, GuestAddress, ReadVolatile};
 
-use crate::{warn, info};
+use crate::{warn, info, Kvm};
 use crate::arch::KvmVm;
 use crate::arch::x86_64::sev::{Sev, SevStarted};
 use crate::vstate::bus::BusDevice;

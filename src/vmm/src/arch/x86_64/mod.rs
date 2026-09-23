@@ -555,7 +555,7 @@ pub fn load_kernel(
 
     // Try to load the image as an ELF (vmlinux); if it has no ELF magic,
     // we try to load it as a bzImage.
-    match ElfLoader::load(guest_memory, None, &mut kernel_file, None) {
+    match ElfLoader::load(guest_memory, None, &mut kernel_file, highmem_start) {
         Ok(elf_result) => {
             let mut entry_point_addr: GuestAddress = elf_result.kernel_load;
             let mut boot_prot: BootProtocol = BootProtocol::LinuxBoot;

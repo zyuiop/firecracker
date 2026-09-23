@@ -4,5 +4,6 @@
 //! Implements Firecracker specific devices (e.g. signal when boot is completed).
 mod boot_timer;
 pub mod fw_cfg;
+pub mod debug_port;
 
 pub use self::boot_timer::BootTimer;

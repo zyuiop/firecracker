@@ -12,14 +12,16 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 use std::{fmt, io, thread};
 
-use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
+use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SEV_TERM, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use libc::{c_int, c_void, siginfo_t};
+use vm_memory::GuestAddress;
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::FcExitCode;
 pub use crate::arch::{KvmVcpu, KvmVcpuConfigureError, KvmVcpuError, Peripherals, VcpuState};
+use crate::arch::x86_64::sev::Sev;
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
 #[cfg(feature = "gdb")]
 use crate::gdb::target::{GdbTargetError, get_raw_tid};
@@ -105,6 +107,9 @@ pub struct Vcpu {
     response_receiver: Option<Receiver<VcpuResponse>>,
     /// The transmitting end of the responses channel owned by the vcpu side.
     response_sender: Sender<VcpuResponse>,
+
+    /// For SEV handling
+    sev_handler: Option<Arc<Sev>>
 }
 
 /// States of the vCPU thread's run loop.
@@ -152,12 +157,18 @@ impl Vcpu {
             #[cfg(feature = "gdb")]
             gdb_event: None,
             kvm_vcpu,
+            sev_handler: None,
         })
     }
 
     /// Sets a MMIO bus for this vcpu.
     pub fn set_mmio_bus(&mut self, mmio_bus: Arc<Bus>) {
         self.kvm_vcpu.peripherals.mmio_bus = Some(mmio_bus);
+    }
+
+    /// Sets a SEV struct for this vCPU
+    pub fn set_sev_handler(&mut self, sev: Arc<Sev>) {
+        self.sev_handler = Some(sev);
     }
 
     /// Attaches the fields required for debugging
@@ -427,7 +438,7 @@ impl Vcpu {
 
                 Ok(VcpuEmulation::Paused)
             }
-            emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result),
+            emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, self.sev_handler.as_ref(), emulation_result),
         }
     }
 }
@@ -435,6 +446,7 @@ impl Vcpu {
 /// Handle the return value of a call to [`VcpuFd::run`] and update our emulation accordingly
 fn handle_kvm_exit(
     peripherals: &mut Peripherals,
+    sev: Option<&Arc<Sev>>,
     emulation_result: Result<VcpuExit, errno::Error>,
 ) -> Result<VcpuEmulation, VcpuError> {
     match emulation_result {
@@ -491,6 +503,17 @@ fn handle_kvm_exit(
                     );
                     Ok(VcpuEmulation::Stopped)
                 }
+                KVM_SYSTEM_EVENT_SEV_TERM => {
+                    // data[0] holds the GHCB MSR value of the request:
+                    // bits [11:0]  GHCBInfo (0x100 = termination request)
+                    // bits [15:12] reason code set
+                    // bits [23:16] reason code
+                    let ghcb_msr = event_flags.first().copied().unwrap_or(0);
+                    let reason_set = (ghcb_msr >> 12) & 0xf;
+                    let reason_code = (ghcb_msr >> 16) & 0xff;
+                    error!("Guest requested termination: reason code set {reason_set:#x}, reason code {reason_code:#x}");
+                    Ok(VcpuEmulation::Stopped)
+                }
                 _ => {
                     METRICS.vcpu.failures.inc();
                     error!(
@@ -502,6 +525,34 @@ fn handle_kvm_exit(
                         VcpuExit::SystemEvent(event_type, event_flags)
                     )))
                 }
+            },
+            VcpuExit::Hypercall(hypercall_exit) => {
+                const KVM_HC_MAP_GPA_RANGE: u64 = 12;
+
+                match (sev, hypercall_exit.nr) {
+                    (Some(sev), KVM_HC_MAP_GPA_RANGE) => {
+                        // https://elixir.bootlin.com/linux/v7.2.5/source/arch/x86/kvm/svm/sev.c#L3765
+                        let [gpa, npages, attrs, ..] = hypercall_exit.args;
+
+                        let result = sev.exit_set_page_state(
+                            GuestAddress(gpa),
+                            npages,
+                            attrs
+                        );
+
+                        if result.is_ok() {
+                            *hypercall_exit.ret = 0;
+                        } else {
+                            *hypercall_exit.ret = (-1000_i64) as u64;
+                        }
+                    }
+                    (_, nr) => {
+                        warn!("unhandled KVM hypercall {nr}");
+                        *hypercall_exit.ret = (-1000_i64) as u64;
+                    }
+                };
+
+                Ok(VcpuEmulation::Handled)
             },
             arch_specific_reason => {
                 // run specific architecture emulation.

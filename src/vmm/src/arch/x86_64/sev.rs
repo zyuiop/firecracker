@@ -1,10 +1,10 @@
 use core::slice;
-use std::{cmp, convert::TryInto, fmt::Display, fs::{File, OpenOptions}, io::{Read, Seek, SeekFrom}, mem::size_of, os::unix::prelude::AsRawFd, path::PathBuf, ptr, sync::Arc};
+use std::{cmp, convert::TryInto, fmt::Display, fs::{File, OpenOptions}, io::{Read, Seek, SeekFrom}, mem, mem::size_of, os::unix::prelude::AsRawFd, path::PathBuf, ptr, sync::Arc};
 use std::fmt::{Debug, Formatter};
 use std::os::fd::RawFd;
 use align_address::Align;
 use kvm_bindings::{kvm_cpuid_entry2, kvm_memory_attributes, kvm_sev_cmd, kvm_sev_launch_measure, kvm_sev_launch_start, kvm_sev_launch_update_data, kvm_sev_snp_launch_finish, kvm_sev_snp_launch_start, kvm_sev_snp_launch_update, sev_cmd_id_KVM_SEV_ES_INIT, sev_cmd_id_KVM_SEV_INIT, sev_cmd_id_KVM_SEV_LAUNCH_FINISH, sev_cmd_id_KVM_SEV_LAUNCH_MEASURE, sev_cmd_id_KVM_SEV_LAUNCH_START, sev_cmd_id_KVM_SEV_LAUNCH_UPDATE_DATA, sev_cmd_id_KVM_SEV_LAUNCH_UPDATE_VMSA, sev_cmd_id_KVM_SEV_SNP_LAUNCH_FINISH, sev_cmd_id_KVM_SEV_SNP_LAUNCH_START, sev_cmd_id_KVM_SEV_SNP_LAUNCH_UPDATE, KVM_SEV_SNP_PAGE_TYPE_CPUID, KVM_SEV_SNP_PAGE_TYPE_NORMAL, KVM_SEV_SNP_PAGE_TYPE_SECRETS, kvm_sev_init, sev_cmd_id_KVM_SEV_INIT2, KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_ATTRIBUTE_PRIVATE};
-use kvm_ioctls::VmFd;
+use kvm_ioctls::{HypercallExit, VmFd};
 use linux_loader::bootparam::boot_e820_entry;
 use sev::error::FirmwareError;
 use sev::firmware::guest::GuestPolicy;
@@ -266,9 +266,10 @@ impl Debug for WrappedLauncher {
 }
 
 /// Struct to hold SEV info
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Sev {
     pub original_config: SevConfig,
+    pub kvm_vm: Arc<KvmVm>
 }
 
 #[repr(C, packed)]
@@ -416,14 +417,15 @@ impl SevStarted {
         assert_eq!(len % 0x1000, 0, "len must be 4KiB aligned");
         assert_eq!(guest_addr.0 % 0x1000, 0, "guest addr must be 4KiB aligned");
 
-        info!(
-                "Registering encrypted memory region: start = 0x{:x}, size = 0x{:x}",
-                guest_addr.0, len
-            );
 
         //extract guest frame number
-        let gfn = guest_addr.0 >> 12;
+        let gpa = guest_addr.0.align_down(0x1000);
+        let gfn = gpa >> 12;
         let addr = guest_mem.get_host_address(guest_addr).unwrap() as u64;
+        info!(
+                "Registering encrypted memory region: start = 0x{:x}, size = 0x{:x}",
+                gpa, len
+            );
 
         let range = unsafe {
             let addr = ptr::with_exposed_provenance(addr as usize);
@@ -541,14 +543,9 @@ impl SevStarted {
                     CPUID_PAGE_LEN,
                     guest_mem,
                     PageType::Cpuid
-                )
-                    .unwrap();
+                )?;
             }
         };
-
-        let mut buf = [0u8; size_of::<CpuidPage>()];
-
-        guest_mem.read_slice(&mut buf, CPUID_PAGE_ADDR).unwrap();
 
         Ok(())
     }
@@ -676,13 +673,13 @@ impl SevStarted {
     }
 
     /// Finish SNP launch sequence
-    pub fn snp_launch_finish(mut self, vm: &VmFd) -> SevResult<Sev> {
+    pub fn snp_launch_finish(mut self, vm: Arc<KvmVm>) -> SevResult<Sev> {
         info!("SNP_LAUNCH_FINISH");
 
         // everything should be pre-encrypted by now so we can register memory
-        self.register_ram_regions(vm);
+        self.register_ram_regions(vm.fd());
         // register the shared regions after registering ram because they probably overlap
-        self.register_shared_regions(vm);
+        self.register_shared_regions(vm.fd());
 
         self.launcher.finish(Finish::new(
             None,
@@ -692,7 +689,8 @@ impl SevStarted {
 
         info!("SNP_LAUNCH_FINISH DONE");
         Ok(Sev {
-            original_config: self.config
+            original_config: self.config,
+            kvm_vm: vm
         })
     }
 
@@ -802,19 +800,45 @@ impl Sev {
         Ok(())
     }
 
-    /// Change page state
-    pub fn set_page_state(vm_fd: &Arc<VmFd>, gfn: u64, pg_size: u64, private: bool) {
+    pub fn exit_set_page_state(&self, gpa: GuestAddress, n_pages: u64, flags: u64) -> SevResult<()> {
+        info!("Set memory region: {gpa:x?} x {n_pages} pg: {flags:x}");
+
+        const KVM_MAP_GPA_RANGE_ENCRYPTED: u64 = 1 << 4;
+        const KVM_MAP_GPA_RANGE_SZ_2M: u64 = 1 << 0;
+        const KVM_MAP_GPA_RANGE_SZ_1G: u64 = 1 << 1;
+
+        let is_private = flags & KVM_MAP_GPA_RANGE_ENCRYPTED != 0;
+        let is_large_pages = flags & KVM_MAP_GPA_RANGE_SZ_2M != 0;
+        let is_huge_pages = flags & KVM_MAP_GPA_RANGE_SZ_1G != 0;
+
+        if is_large_pages && is_huge_pages {
+            panic!("invalid exit: cannot map both large and huge pages!");
+        }
+
+        let page_size = if is_huge_pages {
+            1u64 << 12 << 9 << 9
+        } else if is_large_pages {
+            1 << 12 << 9
+        } else {
+            1 << 12
+        };
+
+        let address = gpa.0.align_down(page_size);
+
         let attrs = kvm_memory_attributes {
-            attributes: if private { 1 << 3 } else { 0 },
-            address: gfn << if pg_size == 0x1000 { 12 } else { 21 },
-            size: pg_size,
+            attributes: if is_private { KVM_MEMORY_ATTRIBUTE_PRIVATE.into() } else { 0 },
+            address,
+            size: n_pages * page_size,
             flags: 0,
         };
 
-        vm_fd.set_memory_attributes(attrs).unwrap();
+        self.kvm_vm.fd().set_memory_attributes(attrs).unwrap();
 
-        if attrs.size != 0 {
-            println!("ERROR 0x{:x}", attrs.size);
-        }
+        Ok(())
+    }
+
+    /// Change page state
+    pub fn set_page_state(vm_fd: &Arc<VmFd>, gfn: u64, pg_size: u64, private: bool) {
+        unimplemented!()
     }
 }

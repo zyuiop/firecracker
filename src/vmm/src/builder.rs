@@ -18,7 +18,7 @@ use vm_memory::GuestAddress;
 
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
-use crate::arch::{configure_system_for_boot, load_kernel, ConfigurationError, MMIO64_MEM_START, MMIO32_MEM_SIZE, MMIO64_MEM_SIZE};
+use crate::arch::{configure_system_for_boot, load_kernel, ConfigurationError, MMIO64_MEM_START, MMIO32_MEM_SIZE, MMIO64_MEM_SIZE, BootProtocol, EntryPoint};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
 use crate::cpu_config::templates::{GetCpuTemplate, GetCpuTemplateError, GuestConfigError};
@@ -59,9 +59,10 @@ use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
 use crate::vstate::vm::{KvmVm, Vm, VmError};
 use crate::{devices, EventManager, Vmm, VmmError, info};
-use crate::arch::x86_64::sev::{Sev, SevError, SevLaunch, SevStarted};
+use crate::arch::x86_64::sev::{Sev, SevError, SevLaunch, SevStarted, FIRMWARE_ADDR};
+use crate::devices::pseudo::debug_port::DebugPort;
 use crate::devices::pseudo::fw_cfg;
-use crate::devices::pseudo::fw_cfg::KernelType;
+use crate::devices::pseudo::fw_cfg::{KernelType, FW_CFG_REG_ADDRESS};
 
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -223,7 +224,16 @@ pub fn build_microvm_for_boot(
     )?;
 
     let guest_memory = kvm_vm.guest_memory();
-    let entry_point = load_kernel(&boot_config.kernel_file, guest_memory)?;
+    let entry_point = if sev.is_some() {
+        EntryPoint {
+            protocol: BootProtocol::SEVBoot,
+            entry_addr: FIRMWARE_ADDR,
+            setup_header: None
+        }
+    } else {
+        load_kernel(&boot_config.kernel_file, guest_memory)?
+    };
+
     let initrd = InitrdConfig::from_config(boot_config, guest_memory, sev.is_some())?;
 
     if !vm_resources.pci_enabled {
@@ -231,14 +241,17 @@ pub fn build_microvm_for_boot(
     }
 
     if let Some(sev) = sev.as_mut() {
-        let kernel_type = attach_fw_cfg_device(
-            &mut device_manager,
-            Arc::clone(&kvm_vm),
-            sev,
-            boot_config,
+        let fw_cfg = fw_cfg::FwCfg::new(
+            boot_config.kernel_file.try_clone().unwrap(),
             &vm_resources.sev.as_ref().unwrap().kernel_hash_path,
             &vm_resources.sev.as_ref().unwrap().initrd_hash_path,
-        )?;
+            Arc::clone(&kvm_vm),
+            Some(sev),
+        );
+
+        let device_manager = device_manager.legacy_devices.as_mut().unwrap();
+        device_manager.enable_fwcfg(kvm_vm.as_ref(), fw_cfg);
+        device_manager.enable_debug_port(kvm_vm.as_ref(), request_ts.clone());
 
         sev.init_firmware_and_kernel(kvm_vm.as_ref(), &initrd)?;
     }
@@ -350,7 +363,7 @@ pub fn build_microvm_for_boot(
     let sev = sev.map(|mut sev| {
         sev.measure_regions(kvm_vm.guest_memory())
             .expect("failed to measure SEV regions");
-        sev.snp_launch_finish(kvm_vm.fd())
+        sev.snp_launch_finish(kvm_vm.clone())
             .expect("failed to start SNP")
     });
 
@@ -361,8 +374,10 @@ pub fn build_microvm_for_boot(
         shutdown_exit_code: None,
         vm,
         device_manager,
-        sev
+        sev_config: sev.as_ref().map(|sev| sev.original_config.clone())
     };
+
+    let sev = sev.map(Arc::new);
 
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -382,6 +397,7 @@ pub fn build_microvm_for_boot(
                 .get("vcpu")
                 .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vcpu".to_string()))?
                 .clone(),
+            sev
         )
         .map_err(VmmError::VcpuStart)?;
     vmm.lock().unwrap().instance_info.state = VmState::Paused;
@@ -553,7 +569,7 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
-        sev: None,
+        sev_config: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -563,6 +579,7 @@ pub fn build_microvm_from_snapshot(
             .get("vcpu")
             .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
             .clone(),
+        None
     )?;
 
     let vmm = Arc::new(Mutex::new(vmm));
@@ -802,31 +819,6 @@ fn attach_balloon_device(
     let id = String::from(balloon.lock().expect("Poisoned lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
     device_manager.attach_boot_virtio_device(vm, id, balloon.clone(), cmdline, event_manager, false)
-}
-
-pub(crate) fn attach_fw_cfg_device(
-    device_manager: &mut DeviceManager,
-    vm: Arc<KvmVm>,
-    sev: &mut SevStarted,
-    boot_config: &BootConfig,
-    kernel_hashes_path: &String,
-    initrd_hashes_path: &Option<String>,
-) -> std::result::Result<KernelType, StartMicrovmError> {
-    let fw_cfg = fw_cfg::FwCfg::new(
-        boot_config.kernel_file.try_clone().unwrap(),
-        kernel_hashes_path,
-        initrd_hashes_path,
-        vm,
-        Some(sev),
-    );
-
-    let kernel_type = fw_cfg.kernel_type();
-
-    device_manager.legacy_devices.as_mut()
-        .expect("missing legacy devices")
-        .register_fwcfg(fw_cfg);
-
-    Ok(kernel_type)
 }
 
 #[cfg(test)]

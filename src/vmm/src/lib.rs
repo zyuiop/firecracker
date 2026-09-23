@@ -317,7 +317,7 @@ pub struct Vmm {
     device_manager: DeviceManager,
 
     #[cfg(all(target_arch = "x86_64"))]
-    sev: Option<Sev>,
+    sev_config: Option<SevConfig>,
 }
 
 impl Vmm {
@@ -421,7 +421,7 @@ impl Vmm {
             }
         });
 
-        let sev_config = self.sev.as_ref().map(|sev| sev.original_config.clone());
+        let sev_config = self.sev_config.clone();
 
         // This must match the From<&VmResources> for VmmConfig implementation
         // in resources.rs which is used to retrieve the config before the VM

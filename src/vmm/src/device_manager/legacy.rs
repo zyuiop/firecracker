@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use acpi_tables::aml::AmlError;
 use acpi_tables::{Aml, aml};
-
+use utils::time::TimestampUs;
 use crate::devices::legacy::{I8042Device, SerialDevice};
+use crate::devices::pseudo::debug_port::DebugPort;
 use crate::devices::pseudo::fw_cfg::{FwCfg, FW_CFG_REG_ADDRESS};
 use crate::vstate::bus::BusError;
 use crate::vstate::vm::KvmVm;
@@ -34,7 +35,8 @@ pub struct PortIODeviceManager {
     // BusDevice::I8042Device
     pub i8042: Arc<Mutex<I8042Device>>,
 
-    pub fw_cfg: Option<Arc<Mutex<FwCfg>>>
+    pub fw_cfg: Option<Arc<Mutex<FwCfg>>>,
+    pub debug_port: Option<Arc<Mutex<DebugPort>>>
 }
 
 impl PortIODeviceManager {
@@ -68,14 +70,6 @@ impl PortIODeviceManager {
             Self::I8042_KDB_DATA_REGISTER_SIZE,
         )?;
 
-        if let Some(dev) = self.fw_cfg.as_ref() {
-            io_bus.insert(
-                dev.clone(),
-                FW_CFG_REG_ADDRESS,
-                0x01,
-            )?;
-        }
-
         vm.register_irq(
             self.stdio_serial
                 .lock()
@@ -95,8 +89,20 @@ impl PortIODeviceManager {
         Ok(())
     }
 
-    pub fn register_fwcfg(&mut self, fw_cfg: FwCfg) {
-        let _ = self.fw_cfg.insert(Arc::new(Mutex::new(fw_cfg)));
+    pub fn enable_fwcfg(&mut self, vm: &KvmVm, fw_cfg: FwCfg) {
+        let device = Arc::new(Mutex::new(fw_cfg));
+        let _ = self.fw_cfg.insert(device.clone());
+
+        vm.pio_bus
+            .insert(device, FW_CFG_REG_ADDRESS, 0x01).expect("failed to insert FWCFG device");
+    }
+
+    pub fn enable_debug_port(&mut self, vm: &KvmVm, timestamp: TimestampUs) {
+        let device = Arc::new(Mutex::new(DebugPort::new(timestamp)));
+        let _ = self.debug_port.insert(device.clone());
+
+        vm.pio_bus
+            .insert(device, 0x80, 0x01).expect("failed to insert Debug device");
     }
 
     pub(crate) fn append_aml_bytes(bytes: &mut Vec<u8>) -> Result<(), AmlError> {
@@ -187,6 +193,7 @@ mod tests {
                 I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap(),
             )),
             fw_cfg: None,
+            debug_port: None,
         };
         ldm.register_devices(&vm).unwrap();
     }

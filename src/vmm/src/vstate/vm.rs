@@ -40,6 +40,7 @@ use crate::vstate::memory::{
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
+use crate::arch::x86_64::sev::Sev;
 
 /// Error type for [`KvmVm::start_vcpus`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -255,6 +256,7 @@ impl KvmVm {
         self: &Arc<Self>,
         mut vcpus: Vec<Vcpu>,
         vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+        sev: Option<Arc<Sev>>
     ) -> Result<(), StartVcpusError> {
         let vcpu_count = vcpus.len();
         let barrier = Arc::new(Barrier::new(vcpu_count + 1));
@@ -271,6 +273,11 @@ impl KvmVm {
         handles.reserve(vcpu_count);
         for mut vcpu in vcpus.drain(..) {
             vcpu.set_mmio_bus(self.common.mmio_bus.clone());
+
+            if let Some(sev) = sev.clone() {
+                vcpu.set_sev_handler(sev)
+            }
+
             #[cfg(target_arch = "x86_64")]
             vcpu.kvm_vcpu.set_pio_bus(self.pio_bus.clone());
 
