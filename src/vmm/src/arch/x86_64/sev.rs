@@ -801,8 +801,6 @@ impl Sev {
     }
 
     pub fn exit_set_page_state(&self, gpa: GuestAddress, n_pages: u64, flags: u64) -> SevResult<()> {
-        info!("Set memory region: {gpa:x?} x {n_pages} pg: {flags:x}");
-
         const KVM_MAP_GPA_RANGE_ENCRYPTED: u64 = 1 << 4;
         const KVM_MAP_GPA_RANGE_SZ_2M: u64 = 1 << 0;
         const KVM_MAP_GPA_RANGE_SZ_1G: u64 = 1 << 1;
@@ -815,13 +813,12 @@ impl Sev {
             panic!("invalid exit: cannot map both large and huge pages!");
         }
 
-        let page_size = if is_huge_pages {
-            1u64 << 12 << 9 << 9
-        } else if is_large_pages {
-            1 << 12 << 9
-        } else {
-            1 << 12
-        };
+        // if `large_pages` is set, the number of pages is already set to 512:
+        // https://elixir.bootlin.com/linux/v7.2.5/source/arch/x86/kvm/svm/sev.c#L3887
+        //
+        // For MSR calls, the size is always small anyway
+        // https://elixir.bootlin.com/linux/v7.2.5/source/arch/x86/kvm/svm/sev.c#L3795
+        let page_size = 0x1000;
 
         let address = gpa.0.align_down(page_size);
 
