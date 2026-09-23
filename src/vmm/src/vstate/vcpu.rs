@@ -554,6 +554,13 @@ fn handle_kvm_exit(
 
                 Ok(VcpuEmulation::Handled)
             },
+            VcpuExit::MemoryFault { flags, gpa, size } => {
+                error!("Memory fault when accessing address: {gpa:#x}");
+                error!("Access size: {size:#x}");
+                error!("Flags: {flags:x}");
+
+                Ok(VcpuEmulation::Stopped)
+            }
             arch_specific_reason => {
                 // run specific architecture emulation.
                 peripherals.run_arch_emulation(arch_specific_reason)
