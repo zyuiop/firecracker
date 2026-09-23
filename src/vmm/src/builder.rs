@@ -58,8 +58,8 @@ use crate::vstate::memory::GuestRegionMmap;
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
 use crate::vstate::vm::{KvmVm, Vm, VmError};
-use crate::{devices, EventManager, Vmm, VmmError};
-use crate::arch::x86_64::sev::Sev;
+use crate::{devices, EventManager, Vmm, VmmError, info};
+use crate::arch::x86_64::sev::{Sev, SevError, SevLaunch, SevStarted};
 use crate::devices::pseudo::fw_cfg;
 use crate::devices::pseudo::fw_cfg::KernelType;
 
@@ -126,6 +126,8 @@ pub enum StartMicrovmError {
     VcpuFdCloneError(#[from] crate::vstate::vcpu::CopyKvmFdError),
     /// Error with the KvmVm object: {0}
     KvmVm(#[from] VmError),
+    /// Error when configuring SEV: {0}
+    Sev(#[from] SevError),
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -177,6 +179,15 @@ pub fn build_microvm_for_boot(
     // Set up KVM VM and register memory regions.
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm, vm_resources.sev.is_some())?;
+
+    // Init must be done *before* initializing CPUs
+    let mut sev = vm_resources.sev.as_ref().map(|sev| {
+        let mut sev_dev = SevLaunch::new(vm.fd(), sev.clone(), request_ts.clone());
+        let mut sev_init = sev_dev.snp_init().expect("failed to initialize SEV");
+        sev_init.add_shared_region(GuestAddress(MMIO64_MEM_START), MMIO64_MEM_SIZE);
+        sev_init
+    });
+
     let mut vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
     vm.register_dram_memory_regions(guest_memory)?;
 
@@ -201,14 +212,6 @@ pub fn build_microvm_for_boot(
 
     let kvm_vm = Arc::new(vm);
     let vm = Vm::Kvm(kvm_vm.clone());
-
-    let mut sev = vm_resources.sev.as_ref().map(|sev| {
-        let mut sev_dev = Sev::new(Arc::clone(&kvm_vm), sev.clone(), request_ts.clone());
-        sev_dev.snp_init().unwrap();
-        sev_dev.add_shared_region(GuestAddress(MMIO64_MEM_START), MMIO64_MEM_SIZE);
-
-        sev_dev
-    });
 
     let mut device_manager = DeviceManager::new(
         event_manager,
@@ -236,6 +239,8 @@ pub fn build_microvm_for_boot(
             &vm_resources.sev.as_ref().unwrap().kernel_hash_path,
             &vm_resources.sev.as_ref().unwrap().initrd_hash_path,
         )?;
+
+        sev.init_firmware_and_kernel(kvm_vm.as_ref(), &initrd)?;
     }
 
     // The boot timer device needs to be the first device attached in order
@@ -341,7 +346,15 @@ pub fn build_microvm_for_boot(
         &mut sev
     )?;
 
-    let mut vmm = Vmm {
+    #[cfg(target_arch = "x86_64")]
+    let sev = sev.map(|mut sev| {
+        sev.measure_regions(kvm_vm.guest_memory())
+            .expect("failed to measure SEV regions");
+        sev.snp_launch_finish(kvm_vm.fd())
+            .expect("failed to start SNP")
+    });
+
+    let vmm = Vmm {
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
@@ -350,11 +363,6 @@ pub fn build_microvm_for_boot(
         device_manager,
         sev
     };
-
-    #[cfg(target_arch = "x86_64")]
-    if vmm.sev.is_some() {
-        vmm.finish_sev().unwrap();
-    }
 
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -799,7 +807,7 @@ fn attach_balloon_device(
 pub(crate) fn attach_fw_cfg_device(
     device_manager: &mut DeviceManager,
     vm: Arc<KvmVm>,
-    sev: &mut Sev,
+    sev: &mut SevStarted,
     boot_config: &BootConfig,
     kernel_hashes_path: &String,
     initrd_hashes_path: &Option<String>,
@@ -909,6 +917,7 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
+            sev: None,
         }
     }
 

@@ -51,7 +51,7 @@ use crate::vstate::memory::{
 };
 use crate::vstate::vcpu::KvmVcpuConfigureError;
 use crate::vstate::vm::KvmVm;
-use crate::{Vcpu, align_down, logger};
+use crate::{align_down, info, logger, Vcpu};
 use kvm::Kvm;
 use layout::{
     CMDLINE_START, MMIO32_MEM_SIZE, MMIO32_MEM_START, MMIO64_MEM_SIZE, MMIO64_MEM_START,
@@ -71,7 +71,7 @@ use linux_loader::loader::{
     Cmdline, Error as KernelLoaderError, KernelLoader, PvhBootCapability, load_cmdline,
 };
 use vm_memory::GuestMemoryBackend;
-use crate::arch::x86_64::sev::{Sev, CPUID_PAGE_ADDR, CPUID_PAGE_LEN, SECRETS_PAGE_ADDR, SECRETS_PAGE_LEN};
+use crate::arch::x86_64::sev::{Sev, CPUID_PAGE_ADDR, CPUID_PAGE_LEN, SECRETS_PAGE_ADDR, SECRETS_PAGE_LEN, SevStarted};
 
 // Value taken from https://elixir.bootlin.com/linux/v5.10.68/source/arch/x86/include/uapi/asm/e820.h#L31
 // Usable normal RAM
@@ -248,7 +248,7 @@ pub fn configure_system_for_boot(
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
-    sev: &mut Option<Sev>
+    sev: &mut Option<SevStarted>
 ) -> Result<(), ConfigurationError> {
     configure_vcpus_for_boot(
         kvm,
@@ -420,7 +420,7 @@ fn configure_64bit_boot(
     cmdline_size: usize,
     initrd: &Option<InitrdConfig>,
     setup_header: Option<setup_header>,
-    sev: &mut Option<Sev>
+    sev: &mut Option<SevStarted>
 ) -> Result<(), ConfigurationError> {
     const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
     const KERNEL_HDR_MAGIC: u32 = 0x5372_6448;
@@ -555,7 +555,7 @@ pub fn load_kernel(
 
     // Try to load the image as an ELF (vmlinux); if it has no ELF magic,
     // we try to load it as a bzImage.
-    match ElfLoader::load(guest_memory, None, &mut kernel_file, highmem_start) {
+    match ElfLoader::load(guest_memory, None, &mut kernel_file, None) {
         Ok(elf_result) => {
             let mut entry_point_addr: GuestAddress = elf_result.kernel_load;
             let mut boot_prot: BootProtocol = BootProtocol::LinuxBoot;

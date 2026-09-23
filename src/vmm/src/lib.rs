@@ -625,55 +625,6 @@ impl Vmm {
         Ok(())
     }
 
-
-    /// Initializes SEV
-    pub fn setup_sev(
-        &mut self,
-        fw_path: &String,
-        mut kernel_file: File,
-        kernel_type: KernelType,
-        initrd: &Option<InitrdConfig>,
-    ) -> Result<u64, VmmError> {
-        let Some(kvm) = self.vm.as_kvm() else {
-            return Ok(0u64);
-        };
-
-        if let Some(sev) = self.sev.as_mut() {
-            sev.load_firmware(fw_path, kvm.guest_memory())
-                .map_err(|err| VmmError::Sev(err))?;
-
-            sev.snp_insert_cpuid_page(kvm.guest_memory(), kvm.common.kvm.supported_cpuid.as_slice())
-                .map_err(|err| VmmError::Sev(err))?;
-
-            sev.snp_insert_secrets_page(kvm.guest_memory())
-                .map_err(|err| VmmError::Sev(err))?;
-
-            return Ok(sev
-                .load_kernel_and_initrd(
-                    &mut kernel_file,
-                    kernel_type == KernelType::BzImage,
-                    kvm.guest_memory(),
-                    initrd,
-                )
-                .map_err(|err| VmmError::Sev(err))?);
-        }
-        Ok(0u64)
-    }
-
-    /// Finishes SEV boot
-    pub fn finish_sev(&mut self) -> Result<(), VmmError> {
-        let Some(kvm) = self.vm.as_kvm() else {
-            return Ok(());
-        };
-
-        if let Some(sev) = self.sev.as_mut() {
-            sev.measure_regions(kvm.guest_memory())?;
-
-            sev.snp_launch_finish()?;
-        }
-        Ok(())
-    }
-
     /// Returns a reference to the balloon device if present.
     pub fn balloon_config(&self) -> Result<BalloonConfig, VmmError> {
         let config = self

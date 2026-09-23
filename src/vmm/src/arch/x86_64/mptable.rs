@@ -15,7 +15,7 @@ use vm_memory::GuestMemoryBackend;
 
 use crate::arch::GSI_LEGACY_END;
 use crate::arch::x86_64::generated::mpspec;
-use crate::arch::x86_64::sev::Sev;
+use crate::arch::x86_64::sev::{Sev, SevStarted};
 use crate::logger::debug;
 use crate::vstate::memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
@@ -118,7 +118,7 @@ pub fn setup_mptable(
     mem: &GuestMemoryMmap,
     resource_allocator: &mut ResourceAllocator,
     num_cpus: u8,
-    sev: &mut Option<Sev>
+    sev: &mut Option<SevStarted>
 ) -> Result<(), MptableError> {
     if num_cpus > MAX_SUPPORTED_CPUS {
         return Err(MptableError::TooManyCpus);
