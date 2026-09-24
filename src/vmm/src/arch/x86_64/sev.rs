@@ -376,6 +376,7 @@ impl<'a> SevLaunch<'a> {
             launcher,
 
             measured_regions: Vec::new(),
+            encrypted_regions: Vec::new(),
             ram_regions: Vec::new(),
             shared_regions: Vec::new()
         })
@@ -389,6 +390,8 @@ pub struct SevStarted {
 
     /// Regions to pre-encrypt
     measured_regions: Vec<MemoryRegion>,
+    /// Regions to pre-encrypt but not measure
+    encrypted_regions: Vec<MemoryRegion>,
     /// Regions that should be marked shared in the RMP
     shared_regions: Vec<MemoryRegion>,
     /// Regions that should be marked private in the RMP
@@ -399,6 +402,11 @@ impl SevStarted {
     /// Add pre-encrypted region
     pub fn add_measured_region(&mut self, start: GuestAddress, len: u64) {
         self.measured_regions.push(MemoryRegion::new(start, len));
+    }
+
+    /// Add pre-encrypted region
+    pub fn add_encrypted_region(&mut self, start: GuestAddress, len: u64) {
+        self.encrypted_regions.push(MemoryRegion::new(start, len));
     }
 
     /// Add region that should be marked shared in the RMP
@@ -557,9 +565,7 @@ impl SevStarted {
         let real = now_tm_us.time_us - self.timestamp.time_us;
         let cpu = now_tm_us.cputime_us - self.timestamp.cputime_us;
         info!("Pre-encryption start: {:>06} us, {:>06} CPU us", real, cpu);
-        while entry.is_some() {
-            let region = entry.as_ref().unwrap();
-
+        while let Some(region) = entry.as_ref() {
             if region.start == FIRMWARE_ADDR {
                 let now_tm_us = TimestampUs::default();
                 let real = now_tm_us.time_us - self.timestamp.time_us;
@@ -589,6 +595,19 @@ impl SevStarted {
 
             entry = self.measured_regions.pop();
         }
+
+        let mut entry = self.encrypted_regions.pop();
+        while let Some(region) = entry.as_ref() {
+            self.snp_launch_update(
+                region.start,
+                region.len.try_into().unwrap(),
+                guest_mem,
+                PageType::Unmeasured
+            )?;
+
+            entry = self.encrypted_regions.pop();
+        }
+
         let now_tm_us = TimestampUs::default();
         let real = now_tm_us.time_us - self.timestamp.time_us;
         let cpu = now_tm_us.cputime_us - self.timestamp.cputime_us;
