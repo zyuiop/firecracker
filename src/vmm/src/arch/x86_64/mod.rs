@@ -36,7 +36,7 @@ pub mod sev;
 use std::cmp::max;
 use std::fs::File;
 
-use super::EntryPoint;
+use super::{EntryPoint, RSDP_ADDR};
 use crate::acpi::create_acpi_tables;
 use crate::arch::{BootProtocol, SYSTEM_MEM_SIZE, SYSTEM_MEM_START, arch_memory_regions_with_gap};
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
@@ -71,7 +71,7 @@ use linux_loader::loader::{
     Cmdline, Error as KernelLoaderError, KernelLoader, PvhBootCapability, load_cmdline,
 };
 use vm_memory::GuestMemoryBackend;
-use crate::arch::x86_64::sev::{Sev, CPUID_PAGE_ADDR, CPUID_PAGE_LEN, SECRETS_PAGE_ADDR, SECRETS_PAGE_LEN, SevStarted};
+use crate::arch::x86_64::sev::{Sev, CPUID_PAGE_ADDR, CPUID_PAGE_LEN, SECRETS_PAGE_ADDR, SECRETS_PAGE_LEN, SevStarted, GHCB_ADDR_ELF, KERNEL_REGION_START};
 
 // Value taken from https://elixir.bootlin.com/linux/v5.10.68/source/arch/x86/include/uapi/asm/e820.h#L31
 // Usable normal RAM
@@ -313,16 +313,16 @@ pub fn configure_system_for_boot(
 
     // Create ACPI tables and write them in guest memory
     // For the time being we only support ACPI in x86_64
-    // let addr = create_acpi_tables(
-    //     vm.guest_memory(),
-    //     device_manager,
-    //     &mut vm.resource_allocator(),
-    //     vcpus,
-    // )?;
-// 
-    // if let Some(sev) = sev {
-    //     sev.add_encrypted_region(addr, 0x1000);
-    // }
+    let addr = create_acpi_tables(
+        vm.guest_memory(),
+        device_manager,
+        &mut vm.resource_allocator(),
+        vcpus,
+    )?;
+
+    if let Some(sev) = sev {
+        sev.add_encrypted_region(addr, 0x1000);
+    }
 
     Ok(())
 }
@@ -460,7 +460,7 @@ fn configure_64bit_boot(
     // We mark first [0x0, SYSTEM_MEM_START) region as usable RAM and the subsequent
     // [SYSTEM_MEM_START, (SYSTEM_MEM_START + SYSTEM_MEM_SIZE)) as reserved (note
     // SYSTEM_MEM_SIZE + SYSTEM_MEM_SIZE == HIMEM_START).
-    add_e820_entry(&mut params, 0, layout::SYSTEM_MEM_START, E820_RAM)?;
+
     add_e820_entry(
         &mut params,
         layout::SYSTEM_MEM_START,
@@ -474,19 +474,20 @@ fn configure_64bit_boot(
         E820_RESERVED,
     )?;
 
-    if sev.is_some() {
-        add_e820_entry(
-            &mut params,
-            SECRETS_PAGE_ADDR.0,
-            SECRETS_PAGE_LEN.into(),
-            E820_RESERVED,
-        )?;
-        add_e820_entry(
-            &mut params,
-            CPUID_PAGE_ADDR.0,
-            CPUID_PAGE_LEN.into(),
-            E820_RESERVED,
-        )?;
+    if let Some(sev) = sev.as_mut() {
+        // Protect memory from CPUID and Secrets pages by marking it reserved
+        add_e820_entry(&mut params, 0, layout::ZERO_PAGE_START, E820_RESERVED)?;
+
+        // Provide the rest of the memory
+        add_e820_entry(&mut params, layout::ZERO_PAGE_START, layout::SYSTEM_MEM_START - layout::ZERO_PAGE_START, E820_RAM)?;
+
+        // Mark the ACPI memory space as encrypted too
+        assert!(himem_start.0 > RSDP_ADDR);
+        let acpi_space_len = himem_start.0 - RSDP_ADDR;
+        sev.add_ram_region(GuestAddress(RSDP_ADDR), acpi_space_len);
+    } else {
+        // Register memory normally
+        add_e820_entry(&mut params, 0, layout::SYSTEM_MEM_START, E820_RAM)?;
     }
 
     for region in guest_mem
@@ -494,11 +495,44 @@ fn configure_64bit_boot(
         .filter(|region| region.region_type == GuestRegionType::Dram)
     {
         // the first 1MB is reserved for the kernel
-        let addr = max(himem_start, region.start_addr());
+        let mut addr = max(himem_start, region.start_addr());
+        let mut end = region.last_addr();
+
+        // SEV: ensure we don't share the memory region where the bounce buffer is located
+        if sev.is_some() && addr < KERNEL_REGION_START {
+            // Potential overlap with protected region!
+            if end > KERNEL_REGION_START {
+                // End is in the "clear" region: we have a valid region
+                if addr < GHCB_ADDR_ELF {
+                    // Region completely overlaps: make a region BEFORE and a region AFTER
+                    // Region before:
+                    add_e820_entry(
+                        &mut params,
+                        addr.raw_value(),
+                        GHCB_ADDR_ELF.unchecked_offset_from(addr),
+                        E820_RAM,
+                    )?;
+
+                    // Region after: fall thru
+                }
+
+                addr = KERNEL_REGION_START;
+            } else if addr >= GHCB_ADDR_ELF {
+                // Start is in the protected region ("if" part)
+                // End is in the protected region ("else" part + end > start)
+                // ==> Skip region entirely
+                continue;
+            } else if end >= GHCB_ADDR_ELF {
+                // Start is clean, end is not
+                end = GuestAddress(GHCB_ADDR_ELF.0 - 1);
+            }
+        }
+
+        let size = end.unchecked_offset_from(addr) + 1;
         add_e820_entry(
             &mut params,
             addr.raw_value(),
-            region.last_addr().unchecked_offset_from(addr) + 1,
+            size,
             E820_RAM,
         )?;
     }

@@ -25,8 +25,11 @@ use crate::vstate::memory::GuestMemoryMmap;
 const MEASUREMENT_LEN: u32 = 48;
 /// Where the SEV firmware will be loaded in guest memory (1MiB)
 pub const FIRMWARE_ADDR: GuestAddress = GuestAddress(0x100000);
+
+pub const KERNEL_REGION_START: GuestAddress = GuestAddress(0x1000000);
+
 /// Where the fw_cfg device will load the kernel elf in chunks
-pub const KERNEL_BOUNCE_BUFFER: GuestAddress = GuestAddress(0x1000000 - 0x200000);
+pub const KERNEL_BOUNCE_BUFFER: GuestAddress = GuestAddress(KERNEL_REGION_START.0 - 0x200000);
 /// Maximum length of the bzImage we can load (16MiB)
 pub const KERNEL_BOUNCE_BUFFER_LEN: u64 = 0x200000;
 /// Where the bzImage will be loaded
@@ -34,7 +37,7 @@ pub const BZIMAGE_ADDR: GuestAddress = GuestAddress(0x2000000);
 /// Max bzimage length
 pub const BZIMAGE_MAX_LEN: u64 = 0x1000000;
 /// Where the GHCB page will be allocated by the firmware (48MiB)
-pub const GHCB_ADDR_ELF: GuestAddress = GuestAddress(0x1000000 - 0x400000);
+pub const GHCB_ADDR_ELF: GuestAddress = GuestAddress(KERNEL_REGION_START.0 - 0x400000);
 /// Where the GHCB page will be allocated by the firmware (48MiB)
 pub const GHCB_ADDR_BZIMAGE: GuestAddress = GuestAddress(0x3000000);
 /// Where the secrets page will be (50MiB)
@@ -626,6 +629,13 @@ impl SevStarted {
         }
     }
 
+    /// Add rem regions to be marked private in RMP
+    pub fn add_ram_region(&mut self, start: GuestAddress, len: u64) {
+        self.ram_regions.push(MemoryRegion::new(
+            start, len
+        ));
+    }
+
     /// register ram regions for snp
     pub fn register_ram_regions(&mut self, vm: &VmFd) {
         let mut entry = self.ram_regions.pop();
@@ -721,25 +731,24 @@ impl SevStarted {
         self.add_shared_region(GHCB_ADDR_ELF, PAGE_SIZE_2MB);
     }
 
-    pub fn share_initrd(
+    fn share_initrd(
         &mut self,
         initrd: &Option<InitrdConfig>,
     ) -> SevResult<()> {
         if let Some(initrd) = initrd {
+            info!("Register initrd: starts at {:#x}, size={:x} bytes",
+                initrd.address.0, initrd.size
+            );
+
             let initrd_load_addr = initrd.address.0;
-            let initrd_size = initrd.size as u64;
-            let align_to_pagesize = |address| address & !(0x200000 - 1);
-            let load_addr_aligned = align_to_pagesize(initrd_load_addr);
-            //plain text inird will be just before its final resting place
-            let plain_text_addr = align_to_pagesize(load_addr_aligned - initrd_size);
+            let initrd_size = initrd.size.align_up(0x1000 << 9 /* 2MiB pages */) as u64;
 
-            let size = if initrd_size > align_to_pagesize(initrd_size) {
-                align_to_pagesize(initrd_size) + 0x200000
-            } else {
-                initrd_size
-            };
+            let load_addr_aligned = initrd_load_addr.align_down(0x1000 << 9 /* 2MiB pages */);
+            let plain_text_addr = (load_addr_aligned - initrd_size).align_down(0x1000 << 9 /* 2MiB pages */);
 
-            self.add_shared_region(GuestAddress(plain_text_addr), size);
+            info!("Added InitRD shared region: {plain_text_addr:#x}, size={initrd_size:x} bytes");
+
+            self.add_shared_region(GuestAddress(plain_text_addr), initrd_size);
         }
 
         Ok(())
@@ -765,60 +774,6 @@ impl SevStarted {
 }
 
 impl Sev {
-    /// Handle a vmgexit when the guest isn't using the MSR protocol
-    pub fn handle_vmgexit(
-        ghcb_msr: u64,
-        guest_mem: &GuestMemoryMmap,
-        vm_fd: &Arc<VmFd>,
-    ) -> SevResult<()> {
-        // info!("vmgexit ghcb msr: 0x{:x}", ghcb_msr);
-        let ghcb_gpa = GuestAddress(ghcb_msr);
-        let len = std::mem::size_of::<Ghcb>();
-
-        //read the ghcb page from the guest
-        let mut buf = vec![0u8; len];
-        guest_mem.read_slice(&mut buf, ghcb_gpa).unwrap();
-
-        let ghcb: &Ghcb = unsafe { std::mem::transmute::<_, &Ghcb>(buf.as_ptr()) };
-
-        let mut shared_buf = vec![0u8; GHCB_SHARED_BUF_SIZE];
-        shared_buf.copy_from_slice(&ghcb.shared_buffer);
-
-        let desc: &mut SnpPscDesc =
-            unsafe { std::mem::transmute::<_, &mut SnpPscDesc>(shared_buf.as_ptr()) };
-
-        let cur_entry = desc.hdr.cur_entry;
-
-        let mut entries = desc.entries;
-
-        for i in cur_entry..(desc.hdr.end_entry + 1) {
-            let entry = entries[i as usize];
-            let private = entry.get_operation() == 1;
-
-            Self::set_page_state(
-                vm_fd,
-                entry.get_gfn(),
-                if entry.get_page_size() == 0 {
-                    0x1000
-                } else {
-                    0x200000
-                },
-                private,
-            );
-
-            entries[i as usize] = PscEntry(entry.0 | 1);
-
-            desc.hdr.cur_entry += 1;
-        }
-
-        let shared_buf_addr = GuestAddress(ghcb_msr + 0x800);
-        // println!("{:?}", shared_buf);
-
-        guest_mem.write_slice(&shared_buf, shared_buf_addr).unwrap();
-
-        Ok(())
-    }
-
     pub fn exit_set_page_state(&self, gpa: GuestAddress, n_pages: u64, flags: u64) -> SevResult<()> {
         const KVM_MAP_GPA_RANGE_ENCRYPTED: u64 = 1 << 4;
         const KVM_MAP_GPA_RANGE_SZ_2M: u64 = 1 << 0;

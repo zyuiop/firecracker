@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
-
+use align_address::Align;
 use vm_memory::{GuestAddress, GuestMemoryBackend, ReadVolatile, VolatileMemoryError};
 
 use crate::arch::initrd_load_addr;
@@ -59,16 +59,16 @@ impl InitrdConfig {
             return Err(InitrdError::Address);
         };
 
-        let address = if !sev {
+        let load_address = if !sev {
             address
         } else {
-            let align_to_pagesize = |address| address & !(0x200000 - 1);
-            let load_addr_aligned = align_to_pagesize(address);
-            align_to_pagesize(load_addr_aligned - size as u64)
+            let load_addr_aligned = address.align_down(0x1000 << 9 /* 2MiB pages */);
+            let size = size.align_up(0x1000 << 9 /* 2MiB pages */) as u64;
+            (load_addr_aligned - size).align_down(0x1000 << 9 /* 2MiB pages */)
         };
 
         let mut slice = vm_memory
-            .get_slice(GuestAddress(address), size)
+            .get_slice(GuestAddress(load_address), size)
             .map_err(|_| InitrdError::Load)?;
         file.read_exact_volatile(&mut slice)
             .map_err(InitrdError::Read)?;
