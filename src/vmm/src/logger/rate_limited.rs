@@ -44,7 +44,7 @@ use std::time::Instant;
 use crate::logger::{IncMetric, METRICS};
 
 /// Maximum number of messages allowed per refill period.
-pub const DEFAULT_BURST: u64 = 10;
+pub const DEFAULT_BURST: u64 = 1000;
 
 /// Refill period in milliseconds (5 seconds).
 pub const DEFAULT_REFILL_TIME_MS: u64 = 5000;
