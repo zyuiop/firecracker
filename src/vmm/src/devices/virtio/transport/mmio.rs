@@ -227,7 +227,7 @@ impl MmioTransport {
 impl BusDevice for MmioTransport {
     fn read(&mut self, base: u64, offset: u64, data: &mut [u8]) {
         match offset {
-            0x00..=0xff if data.len() == 4 || data.len() == 8 => {
+            0x00..=0xff if data.len() == 4 => {
                 let v = match offset {
                     0x0 => MMIO_MAGIC_VALUE,
                     0x04 => MMIO_VERSION,
