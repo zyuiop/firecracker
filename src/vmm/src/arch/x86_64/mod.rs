@@ -504,38 +504,8 @@ fn configure_64bit_boot(
         .filter(|region| region.region_type == GuestRegionType::Dram)
     {
         // the first 1MB is reserved for the kernel
-        let mut addr = max(himem_start, region.start_addr());
-        let mut end = region.last_addr();
-
-        // SEV: ensure we don't share the memory region where the bounce buffer is located
-        if sev.is_some() && addr < KERNEL_REGION_START {
-            // Potential overlap with protected region!
-            if end > KERNEL_REGION_START {
-                // End is in the "clear" region: we have a valid region
-                if addr < KERNEL_BOUNCE_BUFFER {
-                    // Region completely overlaps: make a region BEFORE and a region AFTER
-                    // Region before:
-                    add_e820_entry(
-                        &mut params,
-                        addr.raw_value(),
-                        KERNEL_BOUNCE_BUFFER.unchecked_offset_from(addr),
-                        E820_RAM,
-                    )?;
-
-                    // Region after: fall thru
-                }
-
-                addr = KERNEL_REGION_START;
-            } else if addr >= KERNEL_BOUNCE_BUFFER {
-                // Start is in the protected region ("if" part)
-                // End is in the protected region ("else" part + end > start)
-                // ==> Skip region entirely
-                continue;
-            } else if end >= KERNEL_BOUNCE_BUFFER {
-                // Start is clean, end is not
-                end = GuestAddress(KERNEL_BOUNCE_BUFFER.0 - 1);
-            }
-        }
+        let addr = max(himem_start, region.start_addr());
+        let end = region.last_addr();
 
         let size = end.unchecked_offset_from(addr) + 1;
         add_e820_entry(
