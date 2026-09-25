@@ -71,7 +71,7 @@ use linux_loader::loader::{
     Cmdline, Error as KernelLoaderError, KernelLoader, PvhBootCapability, load_cmdline,
 };
 use vm_memory::GuestMemoryBackend;
-use crate::arch::x86_64::sev::{Sev, CPUID_PAGE_ADDR, CPUID_PAGE_LEN, SECRETS_PAGE_ADDR, SECRETS_PAGE_LEN, SevStarted, GHCB_ADDR_ELF, KERNEL_REGION_START};
+use crate::arch::x86_64::sev::{Sev, CPUID_PAGE_ADDR, CPUID_PAGE_LEN, SECRETS_PAGE_ADDR, SECRETS_PAGE_LEN, SevStarted, GHCB_PAGE_ADDR, KERNEL_REGION_START, KERNEL_BOUNCE_BUFFER};
 
 // Value taken from https://elixir.bootlin.com/linux/v5.10.68/source/arch/x86/include/uapi/asm/e820.h#L31
 // Usable normal RAM
@@ -485,9 +485,10 @@ fn configure_64bit_boot(
 
         add_e820_entry(&mut params, CPUID_PAGE_ADDR.0, 0x1000, E820_RESERVED)?;
         add_e820_entry(&mut params, SECRETS_PAGE_ADDR.0, 0x1000, E820_RESERVED)?;
+        add_e820_entry(&mut params, GHCB_PAGE_ADDR.0, 0x1000, E820_RESERVED)?;
 
-        let size = layout::SYSTEM_MEM_START - (SECRETS_PAGE_ADDR.0 + 0x1000);
-        add_e820_entry(&mut params, SECRETS_PAGE_ADDR.0 + 0x1000, size, E820_RAM)?;
+        let size = layout::SYSTEM_MEM_START - (GHCB_PAGE_ADDR.0 + 0x1000);
+        add_e820_entry(&mut params, GHCB_PAGE_ADDR.0 + 0x1000, size, E820_RAM)?;
 
         // Mark the ACPI memory space as encrypted too
         assert!(himem_start.0 > RSDP_ADDR);
@@ -511,13 +512,13 @@ fn configure_64bit_boot(
             // Potential overlap with protected region!
             if end > KERNEL_REGION_START {
                 // End is in the "clear" region: we have a valid region
-                if addr < GHCB_ADDR_ELF {
+                if addr < KERNEL_BOUNCE_BUFFER {
                     // Region completely overlaps: make a region BEFORE and a region AFTER
                     // Region before:
                     add_e820_entry(
                         &mut params,
                         addr.raw_value(),
-                        GHCB_ADDR_ELF.unchecked_offset_from(addr),
+                        KERNEL_BOUNCE_BUFFER.unchecked_offset_from(addr),
                         E820_RAM,
                     )?;
 
@@ -525,14 +526,14 @@ fn configure_64bit_boot(
                 }
 
                 addr = KERNEL_REGION_START;
-            } else if addr >= GHCB_ADDR_ELF {
+            } else if addr >= KERNEL_BOUNCE_BUFFER {
                 // Start is in the protected region ("if" part)
                 // End is in the protected region ("else" part + end > start)
                 // ==> Skip region entirely
                 continue;
-            } else if end >= GHCB_ADDR_ELF {
+            } else if end >= KERNEL_BOUNCE_BUFFER {
                 // Start is clean, end is not
-                end = GuestAddress(GHCB_ADDR_ELF.0 - 1);
+                end = GuestAddress(KERNEL_BOUNCE_BUFFER.0 - 1);
             }
         }
 
