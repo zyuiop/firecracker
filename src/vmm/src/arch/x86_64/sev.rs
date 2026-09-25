@@ -38,8 +38,6 @@ pub const BZIMAGE_ADDR: GuestAddress = GuestAddress(0x2000000);
 pub const BZIMAGE_MAX_LEN: u64 = 0x1000000;
 /// Where the GHCB page will be allocated by the firmware (48MiB)
 pub const GHCB_PAGE_ADDR: GuestAddress = GuestAddress(0x3000);
-/// Where the GHCB page will be allocated by the firmware (48MiB)
-pub const GHCB_ADDR_BZIMAGE: GuestAddress = GuestAddress(0x3000000);
 /// Where the secrets page will be (50MiB)
 pub const SECRETS_PAGE_ADDR: GuestAddress = GuestAddress(0x2000);
 /// Length of the secrets page
@@ -701,11 +699,11 @@ impl SevStarted {
 
     pub(crate) fn load_kernel(&mut self, kernel_type: KernelType, kernel_file: &File, vm: &KvmVm) -> Result<EntryPoint, SevError> {
         // Share GHCB
+        self.add_shared_region(GHCB_PAGE_ADDR, 0x1000);
 
         if kernel_type == KernelType::Direct {
             // set the plain text bounce buffer for kernel elf data shared
             self.add_shared_region(KERNEL_BOUNCE_BUFFER, KERNEL_BOUNCE_BUFFER_LEN);
-            self.add_shared_region(GHCB_PAGE_ADDR, 0x1000);
 
             return Ok(EntryPoint {
                 protocol: BootProtocol::SEVBoot,
@@ -728,7 +726,6 @@ impl SevStarted {
         // Share regions
         info!("Sharing BzImage kernel regions");
         self.add_shared_region(BZIMAGE_ADDR, BZIMAGE_MAX_LEN);
-        self.add_shared_region(GHCB_ADDR_BZIMAGE, PAGE_SIZE_2MB);
 
         Ok(EntryPoint {
             protocol: BootProtocol::SEVBoot,
