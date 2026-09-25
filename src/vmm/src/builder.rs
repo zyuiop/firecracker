@@ -224,23 +224,9 @@ pub fn build_microvm_for_boot(
     )?;
 
     let guest_memory = kvm_vm.guest_memory();
-    let entry_point = if sev.is_some() {
-        EntryPoint {
-            protocol: BootProtocol::SEVBoot,
-            entry_addr: FIRMWARE_ADDR,
-            setup_header: None
-        }
-    } else {
-        load_kernel(&boot_config.kernel_file, guest_memory)?
-    };
-
     let initrd = InitrdConfig::from_config(boot_config, guest_memory, sev.is_some())?;
 
-    if !vm_resources.pci_enabled {
-        boot_cmdline.insert("pci", "off")?;
-    }
-
-    if let Some(sev) = sev.as_mut() {
+    let entry_point = if let Some(sev) = sev.as_mut() {
         let fw_cfg = fw_cfg::FwCfg::new(
             boot_config.kernel_file.try_clone().unwrap(),
             &vm_resources.sev.as_ref().unwrap().kernel_hash_path,
@@ -249,11 +235,23 @@ pub fn build_microvm_for_boot(
             Some(sev),
         );
 
+        let kernel_type = fw_cfg.kernel_type();
+
         let device_manager = device_manager.legacy_devices.as_mut().unwrap();
         device_manager.enable_fwcfg(kvm_vm.as_ref(), fw_cfg);
         device_manager.enable_debug_port(kvm_vm.as_ref(), request_ts.clone());
 
-        sev.init_firmware_and_kernel(kvm_vm.as_ref(), &initrd)?;
+        sev.load_firmware(kvm_vm.as_ref())?;
+        sev.load_initrd(&initrd)?;
+
+        sev.load_kernel(kernel_type, &boot_config.kernel_file, kvm_vm.as_ref())?
+    } else {
+        load_kernel(&boot_config.kernel_file, guest_memory)?
+    };
+
+
+    if !vm_resources.pci_enabled {
+        boot_cmdline.insert("pci", "off")?;
     }
 
     // The boot timer device needs to be the first device attached in order

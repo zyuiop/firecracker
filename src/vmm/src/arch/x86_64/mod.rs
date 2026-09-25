@@ -35,7 +35,7 @@ pub mod sev;
 
 use std::cmp::max;
 use std::fs::File;
-
+use kvm_bindings::{KVM_CAP_MAX_VCPU_ID, KVM_MAX_CPUID_ENTRIES};
 use super::{EntryPoint, RSDP_ADDR};
 use crate::acpi::create_acpi_tables;
 use crate::arch::{BootProtocol, SYSTEM_MEM_SIZE, SYSTEM_MEM_START, arch_memory_regions_with_gap};
@@ -204,7 +204,7 @@ fn configure_vcpus_for_boot(
     cpu_template: &CustomCpuTemplate,
     guest_mem: &GuestMemoryMmap,
     entry_point: EntryPoint,
-    initrd: &Option<InitrdConfig>
+    initrd: &Option<InitrdConfig>,
 ) -> Result<(), ConfigurationError> {
     // Phase 1: construct the shared, templated guest CPUID.
     let cpuid = Cpuid::try_from(kvm.supported_cpuid.clone()).map_err(GuestConfigError::from)?;
@@ -257,7 +257,7 @@ pub fn configure_system_for_boot(
         cpu_template,
         vm.guest_memory(),
         entry_point,
-        initrd
+        initrd,
     )?;
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
@@ -322,6 +322,11 @@ pub fn configure_system_for_boot(
 
     if let Some(sev) = sev {
         sev.add_encrypted_region(addr, 0x1000);
+
+        let cpuid = vcpus[0].kvm_vcpu.fd.get_cpuid2(KVM_MAX_CPUID_ENTRIES)
+            .expect("failed to read CPU cpuid");
+        sev.snp_insert_cpuid_page(vm.guest_memory(), cpuid.as_slice())
+            .expect("failed to snp insert cpuid");
     }
 
     Ok(())
@@ -476,10 +481,13 @@ fn configure_64bit_boot(
 
     if let Some(sev) = sev.as_mut() {
         // Protect memory from CPUID and Secrets pages by marking it reserved
-        add_e820_entry(&mut params, 0, layout::ZERO_PAGE_START, E820_RESERVED)?;
+        add_e820_entry(&mut params, 0, CPUID_PAGE_ADDR.0, E820_RAM)?;
 
-        // Provide the rest of the memory
-        add_e820_entry(&mut params, layout::ZERO_PAGE_START, layout::SYSTEM_MEM_START - layout::ZERO_PAGE_START, E820_RAM)?;
+        add_e820_entry(&mut params, CPUID_PAGE_ADDR.0, 0x1000, E820_RESERVED)?;
+        add_e820_entry(&mut params, SECRETS_PAGE_ADDR.0, 0x1000, E820_RESERVED)?;
+
+        let size = layout::SYSTEM_MEM_START - (SECRETS_PAGE_ADDR.0 + 0x1000);
+        add_e820_entry(&mut params, SECRETS_PAGE_ADDR.0 + 0x1000, size, E820_RAM)?;
 
         // Mark the ACPI memory space as encrypted too
         assert!(himem_start.0 > RSDP_ADDR);
@@ -610,6 +618,7 @@ pub fn load_kernel(
                 entry_addr: entry_point_addr,
                 protocol: boot_prot,
                 setup_header: None,
+                kernel_length: None
             })
         }
         // Not an ELF image: fall back to the bzImage loader.
@@ -642,6 +651,7 @@ pub fn load_kernel(
                 entry_addr,
                 protocol: BootProtocol::LinuxBoot,
                 setup_header: bzimage_result.setup_header,
+                kernel_length: None
             })
         }
         Err(err) => Err(ConfigurationError::KernelLoader(err)),

@@ -164,6 +164,8 @@ pub struct EntryPoint {
     /// `None` for ELF (`vmlinux`) kernels.
     #[cfg(target_arch = "x86_64")]
     pub setup_header: Option<linux_loader::loader::bootparam::setup_header>,
+
+    pub kernel_length: Option<u64>,
 }
 
 /// Adds in [`regions`] the valid memory regions suitable for RAM taking into account a gap in the

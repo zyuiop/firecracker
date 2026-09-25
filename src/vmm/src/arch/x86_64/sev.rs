@@ -13,8 +13,8 @@ use sev::launch::PageType;
 use sev::launch::snp::{Finish, Launcher, New, Start, Started, Update};
 use thiserror::Error;
 use utils::time::TimestampUs;
-use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryBackend};
-use crate::arch::KvmVm;
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend};
+use crate::arch::{BootProtocol, ConfigurationError, EntryPoint, KvmVm};
 use crate::{info, warn, VmmError};
 use crate::devices::pseudo::fw_cfg::KernelType;
 use crate::initrd::InitrdConfig;
@@ -484,7 +484,8 @@ impl SevStarted {
             reserved: u64,
         }
 
-        #[repr(C, packed)]
+        #[repr(C, align(0x1000))]
+        #[derive(Debug)]
         struct CpuidPage {
             count: u32,
             reserved: u32,
@@ -497,7 +498,19 @@ impl SevStarted {
         let mut page_entries = [CpuidFunction::default(); CPUID_FUNCTION_COUNT_MAX as usize];
 
         //construct list of cpuid entries
-        for (i, entry) in cpuid.iter().enumerate() {
+        let mut cpuid_entries = cpuid.iter().collect::<Vec<_>>();
+        cpuid_entries.sort_by_key(|item| {
+                if item.function == 0x8000_001f || item.function == 0x8000_0000 {
+                    0
+                } else if item.function < 0x10 {
+                    50
+                } else {
+                    100 // Lowest priority
+                }
+            });
+        cpuid_entries.truncate(CPUID_FUNCTION_COUNT_MAX as usize);
+
+        for (i, entry) in cpuid_entries.iter().enumerate() {
             let xcr0_in = if entry.function == 0xd {
                 // (entry.edx as u64) << 32 | entry.eax as u64
                 1
@@ -517,18 +530,11 @@ impl SevStarted {
                 reserved: 0,
             };
 
-            // println!("before: {:?}", func);
-
-            //TODO check if i goes beyond max cpuid count
-            if i == CPUID_FUNCTION_COUNT_MAX as usize {
-                break;
-            }
             page_entries[i] = func;
         }
 
-        let cpuid_count = cmp::min(CPUID_FUNCTION_COUNT_MAX as usize, cpuid.len());
         let cpuid_page = CpuidPage {
-            count: cpuid_count as u32,
+            count: cpuid_entries.len() as u32,
             reserved: 0,
             reserved1: 0,
             functions: page_entries,
@@ -693,12 +699,47 @@ impl SevStarted {
         }
     }
 
-    pub fn init_firmware_and_kernel(&mut self, kvm: &KvmVm, initrd: &Option<InitrdConfig>) -> Result<(), SevError> {
-        self.load_firmware(kvm.guest_memory())?;
-        self.snp_insert_cpuid_page(kvm.guest_memory(), kvm.common.kvm.supported_cpuid.as_slice())?;
+    pub(crate) fn load_kernel(&mut self, kernel_type: KernelType, kernel_file: &File, vm: &KvmVm) -> Result<EntryPoint, SevError> {
+        if kernel_type == KernelType::Direct {
+            // set the plain text bounce buffer for kernel elf data shared
+            self.add_shared_region(KERNEL_BOUNCE_BUFFER, KERNEL_BOUNCE_BUFFER_LEN);
+            self.add_shared_region(GHCB_ADDR_ELF, PAGE_SIZE_2MB);
+
+            return Ok(EntryPoint {
+                protocol: BootProtocol::SEVBoot,
+                entry_addr: FIRMWARE_ADDR,
+                setup_header: None,
+                kernel_length: None
+            })
+        }
+
+        let mut kernel_file = kernel_file.try_clone().expect("failed to clone kernel fd");
+        kernel_file.seek(SeekFrom::Start(0)).unwrap();
+        let len = kernel_file.seek(SeekFrom::End(0)).unwrap();
+        kernel_file.seek(SeekFrom::Start(0)).unwrap();
+
+        //Load bzimage at 16mib
+        vm.guest_memory()
+            .read_volatile_from(BZIMAGE_ADDR, &mut kernel_file, len.try_into().unwrap())
+            .expect("failed to read kernel file");
+
+        // Share regions
+        info!("Sharing BzImage kernel regions");
+        self.add_shared_region(BZIMAGE_ADDR, BZIMAGE_MAX_LEN);
+        self.add_shared_region(GHCB_ADDR_BZIMAGE, PAGE_SIZE_2MB);
+
+        Ok(EntryPoint {
+            protocol: BootProtocol::SEVBoot,
+            entry_addr: FIRMWARE_ADDR,
+            setup_header: None,
+            kernel_length: Some(len)
+        })
+    }
+
+    pub fn load_firmware(&mut self, kvm: &KvmVm) -> Result<(), SevError> {
+        self.insert_firmware(kvm.guest_memory())?;
         self.snp_insert_secrets_page(kvm.guest_memory())?;
-        self.prepare_shared_regions();
-        self.share_initrd(&initrd)
+        Ok(())
     }
 
     /// Finish SNP launch sequence
@@ -723,15 +764,7 @@ impl SevStarted {
         })
     }
 
-    pub fn prepare_shared_regions(
-        &mut self,
-    ) {
-        // set the plain text bounce buffer for kernel elf data shared
-        self.add_shared_region(KERNEL_BOUNCE_BUFFER, KERNEL_BOUNCE_BUFFER_LEN);
-        self.add_shared_region(GHCB_ADDR_ELF, PAGE_SIZE_2MB);
-    }
-
-    fn share_initrd(
+    pub fn load_initrd(
         &mut self,
         initrd: &Option<InitrdConfig>,
     ) -> SevResult<()> {
@@ -755,7 +788,7 @@ impl SevStarted {
     }
 
     ///Load SEV firmware
-    pub fn load_firmware(&mut self, guest_mem: &GuestMemoryMmap) -> SevResult<()> {
+    fn insert_firmware(&mut self, guest_mem: &GuestMemoryMmap) -> SevResult<()> {
         let path = PathBuf::from(&self.config.firmware_path);
         let mut f_firmware = File::open(path.as_path()).unwrap();
         f_firmware.seek(SeekFrom::Start(0)).unwrap();

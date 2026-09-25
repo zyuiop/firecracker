@@ -123,6 +123,7 @@ pub fn setup_regs(vcpu: &VcpuFd, entry_point: EntryPoint, initrd: &Option<Initrd
                 rsi: super::layout::ZERO_PAGE_START,
 
                 rbx: super::layout::PVH_INFO_START,
+                rcx: entry_point.kernel_length.unwrap_or_default(),
 
                 // Custom registers for initrd... (TODO: remove and make this standard from BootInfo)
                 r14: initrd.as_ref().map(|rd| rd.size as u64).unwrap_or_default(),
@@ -268,6 +269,7 @@ fn configure_segments_and_sregs(
         BootProtocol::PvhBoot | BootProtocol::SEVBoot => {
             sregs.cr0 = X86_CR0_PE | X86_CR0_ET;
             sregs.cr4 = 0;
+            // sregs.cr4 |= 0x00000200 | 0x00000400 | 0x00040000;
         }
         BootProtocol::LinuxBoot => {
             // 64-bit protected mode
