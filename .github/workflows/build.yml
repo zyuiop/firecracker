@@ -1,4 +1,4 @@
-name: Monitor libseccomp Releases
+name: Build / release
 
 on:
   push:
