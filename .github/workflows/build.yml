@@ -5,11 +5,10 @@ on:
     tags:
       - v*
 
-env:
-  GH_TOKEN: ${{ github.token }}
-
 jobs:
   check-release:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -19,3 +18,5 @@ jobs:
           ./tools/devtool -y build --release
       - name: Publish
         run: gh release create ${{ github.ref }} --title ${{ github.ref }} build/cargo_target/x86_64-unknown-linux-musl/release/firecracker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
